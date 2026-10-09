@@ -18,11 +18,13 @@ import {
   lastPerformance,
   mainPlans,
   makeAbsPlan,
+  makeExpressPlan,
   makeFlexPlan,
   makeMissedRecord,
   makeRestRecord,
   migrateStore,
   personalBest,
+  progressionHint,
   progressionExercises,
   recoveryStatus,
   skillMetrics,
@@ -47,7 +49,8 @@ import {
 type Tab = "home" | "program" | "summary" | "skills" | "settings" | "workout";
 type SummaryView = "session" | "progress" | "journal";
 type ProgressMetric = "best" | "average" | "total";
-type Sheet = { type: "skip" } | { type: "jump"; day: number } | { type: "exit" } | { type: "exercises" } | null;
+type Sheet = { type: "skip" } | { type: "jump"; day: number } | { type: "exit" } | { type: "exercises" } | { type: "record"; id: string } | null;
+type PersonalRecord = { name: string; value: number; before: number; unit: string };
 
 type ExerciseGroup = { key: string; firstIndex: number; entries: { index: number; step: ActiveStep }[] };
 
@@ -143,7 +146,7 @@ function previousLine(previous: PreviousPerformance) {
 }
 
 function previousDetails(previous: PreviousPerformance) {
-  const variants = [...new Set(previous.results.map((result) => result.variant.trim()).filter(Boolean))];
+  const variants = [...new Set(previous.results.map((result) => result.variant.trim()).filter((value) => value && !/^[0\-–—.]+$/.test(value)))];
   const ballasts = [...new Set(previous.results.map((result) => result.ballast).filter((value): value is number => value !== null && value > 0))];
   const challengeSets = previous.results[0].challengeSets;
   return [
@@ -184,6 +187,33 @@ function Icon({ name, size = 22, stroke = 1.9 }: { name: IconName; size?: number
   return <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={stroke} strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
 
+function unlockAudio(ref: { current: AudioContext | null }) {
+  try {
+    const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!Ctor) return;
+    if (!ref.current) ref.current = new Ctor();
+    if (ref.current.state === "suspended") ref.current.resume().catch(() => undefined);
+  } catch { /* pas de son, pas grave */ }
+}
+
+function playBeep(ref: { current: AudioContext | null }) {
+  const ctx = ref.current;
+  if (!ctx) return;
+  try {
+    [0, 0.22].forEach((delay) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.frequency.value = 880;
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime + delay);
+      gain.gain.exponentialRampToValueAtTime(0.25, ctx.currentTime + delay + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + delay + 0.16);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(ctx.currentTime + delay);
+      osc.stop(ctx.currentTime + delay + 0.18);
+    });
+  } catch { /* ignore */ }
+}
+
 function Delta({ value }: { value: number | null }) {
   if (value === null) return null;
   return <span className={`delta ${value > 0 ? "up" : value < 0 ? "down" : "same"}`}>{value > 0 ? `+${value}` : value === 0 ? "=" : value}</span>;
@@ -199,9 +229,7 @@ export default function App() {
   const [sheet, setSheet] = useState<Sheet>(null);
   const [selectedPlanId, setSelectedPlanId] = useState(mainPlans[0].id);
   const [summaryView, setSummaryView] = useState<SummaryView>("session");
-  const [timerSeconds, setTimerSeconds] = useState(0);
-  const [timerRunning, setTimerRunning] = useState(false);
-  const [timerLabel, setTimerLabel] = useState("Repos");
+  const [, setTick] = useState(0);
   const [absKey, setAbsKey] = useState<AbsRoutineKey>("beginner");
   const [absEffort, setAbsEffort] = useState(45);
   const [absTransition, setAbsTransition] = useState(15);
@@ -214,25 +242,57 @@ export default function App() {
   const [progressExerciseId, setProgressExerciseId] = useState("pull-explosive");
   const [progressMetric, setProgressMetric] = useState<ProgressMetric>("best");
   const [tipsOpen, setTipsOpen] = useState(false);
+  const [newRecords, setNewRecords] = useState<PersonalRecord[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const audioRef = useRef<AudioContext | null>(null);
 
   useEffect(() => {
     try {
       const saved = window.localStorage.getItem(STORAGE_KEY);
-      if (saved) { setStore(migrateStore(JSON.parse(saved))); return; }
+      if (saved) {
+        const restored = migrateStore(JSON.parse(saved));
+        setStore(restored);
+        // Séance en cours récente : on la rouvre directement (l'iPhone a pu recharger l'appli).
+        if (restored.active && Date.now() - (restored.active.lastActivityAt ?? restored.active.startedAt) < 3 * 3600 * 1000) setTab("workout");
+        return;
+      }
     } catch { /* Une sauvegarde locale abîmée ne doit pas bloquer l'appli. */ }
     setStore(createDefaultStore());
   }, []);
   useEffect(() => { if (store) { try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store)); } catch { /* stockage plein ou bloqué */ } } }, [store]);
   useEffect(() => { if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js").catch(() => undefined); }, []);
+
+  /* Chrono basé sur l'heure de fin : il reste juste même si l'iPhone se verrouille. */
+  const restEndAt = store?.active?.restEndAt ?? null;
   useEffect(() => {
-    if (!timerRunning || timerSeconds <= 0) return;
-    const timer = window.setInterval(() => setTimerSeconds((value) => {
-      if (value <= 1) { setTimerRunning(false); try { navigator.vibrate?.(300); } catch { /* iOS */ } return 0; }
-      return value - 1;
-    }), 1000);
-    return () => window.clearInterval(timer);
-  }, [timerRunning, timerSeconds]);
+    if (!restEndAt) return;
+    const tick = () => {
+      if (Date.now() >= restEndAt) {
+        playBeep(audioRef);
+        try { navigator.vibrate?.([200, 100, 200]); } catch { /* non supporté sur iOS */ }
+        setStore((current) => current?.active && current.active.restEndAt === restEndAt ? { ...current, active: { ...current.active, restEndAt: null } } : current);
+      } else setTick((value) => value + 1);
+    };
+    tick();
+    const timer = window.setInterval(tick, 500);
+    document.addEventListener("visibilitychange", tick);
+    return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", tick); };
+  }, [restEndAt]);
+
+  /* Écran allumé pendant la séance (iOS 16.4+ en appli installée). */
+  const inWorkoutMode = tab === "workout" && Boolean(store?.active);
+  useEffect(() => {
+    if (!inWorkoutMode || !("wakeLock" in navigator)) return;
+    let lock: WakeLockSentinel | null = null;
+    let cancelled = false;
+    const acquire = async () => {
+      if (document.visibilityState !== "visible") return;
+      try { const next = await navigator.wakeLock.request("screen"); if (cancelled) next.release().catch(() => undefined); else lock = next; } catch { /* refusé : pas grave */ }
+    };
+    acquire();
+    document.addEventListener("visibilitychange", acquire);
+    return () => { cancelled = true; document.removeEventListener("visibilitychange", acquire); lock?.release().catch(() => undefined); };
+  }, [inWorkoutMode]);
 
   const absPlan = useMemo(() => makeAbsPlan(absKey, absEffort, absTransition, absRounds), [absKey, absEffort, absTransition, absRounds]);
   const flexPlan = useMemo(() => makeFlexPlan(flexKey, flexSets, flexHold, flexRest), [flexKey, flexSets, flexHold, flexRest]);
@@ -260,16 +320,24 @@ export default function App() {
   const weekMainDone = weekRecords.filter((record) => record.kind === "main" || record.kind === "challenge").length;
   const lastSession = [...store.history].reverse().find(isTrainingRecord) ?? null;
   const selectedPlan = mainPlans.find((plan) => plan.id === selectedPlanId) ?? mainPlans[0];
+  const daysSinceExport = store.lastExportAt ? Math.floor((Date.now() - Date.parse(store.lastExportAt)) / 86400000) : null;
+  const needsBackup = store.history.length > 0 && (daysSinceExport === null || daysSinceExport >= 7);
+  const hint = step ? progressionHint(store.history, step, step.levelKey ? store.levels[step.levelKey] : null) : null;
+  const editedRecord = sheet?.type === "record" ? store.history.find((record) => record.id === sheet.id) ?? null : null;
   const jumpTarget = sheet?.type === "jump" ? sheet.day : null;
   const jumpSkipped = jumpTarget ? Array.from({ length: jumpTarget - store.cycleDay }, (_, index) => store.cycleDay + index) : [];
 
   /* ---------- actions ---------- */
-  const resetTimer = () => { setTimerRunning(false); setTimerSeconds(0); };
-  const startRest = (seconds: number, label = "Repos") => { if (seconds <= 0) return; setTimerLabel(label); setTimerSeconds(seconds); setTimerRunning(true); };
+  const setRest = (endAt: number | null, label?: string) => setStore((current) => !current?.active ? current : { ...current, active: { ...current.active, restEndAt: endAt, restLabel: label ?? current.active.restLabel } });
+  const resetTimer = () => setRest(null);
+  const startRest = (seconds: number, label = "Repos") => { if (seconds <= 0) return; unlockAudio(audioRef); setRest(Date.now() + seconds * 1000, label); };
+  const addRest = (seconds: number) => setRest(Math.max(restEndAt ?? 0, Date.now()) + seconds * 1000);
+  const restRemaining = restEndAt ? Math.max(0, Math.ceil((restEndAt - Date.now()) / 1000)) : 0;
 
-  const startPlan = (plan: Plan, advancesPlan: boolean) => {
+  const startPlan = (plan: Plan, advancesPlan: boolean, express = false) => {
     if (active && !window.confirm(`« ${active.plan.title} » est en cours. La remplacer ?`)) return;
-    setStore({ ...store, active: { plan, startedAt: Date.now(), stepIndex: 0, steps: flattenPlan(plan), warmupDone: false, advancesPlan, activeMs: 0, lastActivityAt: Date.now() } });
+    setStore({ ...store, active: { plan, startedAt: Date.now(), stepIndex: 0, steps: flattenPlan(plan), warmupDone: false, advancesPlan, activeMs: 0, lastActivityAt: Date.now(), express } });
+    setSheet(null);
     resetTimer();
     setTab("workout");
     window.scrollTo({ top: 0 });
@@ -345,7 +413,17 @@ export default function App() {
       completedSteps: session.steps.filter((item) => item.result.done).length,
       totalSteps: session.steps.length,
       results,
+      note: session.note?.trim() || undefined,
+      express: session.express || undefined,
     };
+    const records: PersonalRecord[] = [];
+    [...new Set(results.map((result) => result.exerciseId))].forEach((exerciseId) => {
+      const own = results.filter((result) => result.exerciseId === exerciseId);
+      const values = own.map((result) => result.tracking === "challenge" ? result.challengeTotal : result.done ? result.value : null).filter((value): value is number => value !== null && value > 0);
+      const before = personalBest(store.history, exerciseId);
+      if (values.length && before && Math.max(...values) > before.value) records.push({ name: own[0].exerciseName, value: Math.max(...values), before: before.value, unit: own[0].tracking === "seconds" ? "s" : "reps" });
+    });
+    setNewRecords(records);
     const base = { ...store, history: [...store.history, record], active: null };
     setStore(session.advancesPlan ? advanceCycle(base) : base);
     resetTimer();
@@ -375,20 +453,48 @@ export default function App() {
     setSkillInputs({ ...skillInputs, [skillId]: "" });
   };
 
-  const exportData = () => {
-    const url = URL.createObjectURL(new Blob([JSON.stringify(store, null, 2)], { type: "application/json" }));
+  const exportData = async () => {
+    const exportedAt = new Date().toISOString();
+    const snapshot = { ...store, lastExportAt: exportedAt };
+    const name = `baptiste-training-${toLocalDate(new Date())}.json`;
+    const json = JSON.stringify(snapshot, null, 2);
+    const markDone = () => setStore((current) => current ? { ...current, lastExportAt: exportedAt } : current);
+    try {
+      const file = new File([json], name, { type: "application/json" });
+      if (navigator.canShare?.({ files: [file] })) {
+        await navigator.share({ files: [file], title: "Sauvegarde Baptiste Training" });
+        markDone();
+        return;
+      }
+    } catch (error) {
+      if ((error as Error).name === "AbortError") return;
+    }
+    const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
     const link = document.createElement("a");
     link.href = url;
-    link.download = `baptiste-training-${toLocalDate(new Date())}.json`;
+    link.download = name;
     link.click();
     URL.revokeObjectURL(url);
+    markDone();
   };
+
+  const updateRecord = (id: string, mapper: (record: SessionRecord) => SessionRecord) =>
+    setStore((current) => current ? { ...current, history: current.history.map((record) => record.id === id ? mapper(record) : record) } : current);
+  const updateRecordResult = (id: string, resultIndex: number, field: "value" | "ballast", raw: string) =>
+    updateRecord(id, (record) => ({ ...record, results: record.results.map((result, index) => index === resultIndex ? { ...result, [field]: raw === "" ? null : Number(raw.replace(",", ".")) } : result) }));
+  const deleteRecord = (id: string) => {
+    if (!window.confirm("Supprimer cette entrée du journal ? Le planning ne recule pas.")) return;
+    setStore((current) => current ? { ...current, history: current.history.filter((record) => record.id !== id) } : current);
+    setSheet(null);
+  };
+  const setActiveNote = (note: string) => setStore((current) => current?.active ? { ...current, active: { ...current.active, note } } : current);
 
   const importData = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
     try {
       const parsed = migrateStore(JSON.parse(await file.text()));
+      if (!parsed.lastExportAt) parsed.lastExportAt = new Date().toISOString();
       if (store.history.length && !window.confirm(`Remplacer tes ${store.history.length} entrées par cette sauvegarde (${parsed.history.length} entrées) ?`)) return;
       setStore(parsed);
       setTab("home");
@@ -429,6 +535,7 @@ export default function App() {
       </header>
 
       {staleActive && active && <div className="notice warning"><div><strong>Séance restée ouverte</strong><p>{active.plan.title}, commencée le {formatShortDate(toLocalDate(new Date(active.startedAt)))}.</p></div><div className="notice-actions"><button className="btn btn-quiet" onClick={() => setTab("workout")}>Ouvrir</button><button className="btn btn-quiet danger" onClick={abandonSession}>Abandonner</button></div></div>}
+      {needsBackup && !staleActive && <div className="notice"><div><strong>{daysSinceExport === null ? "Aucune sauvegarde récente" : `Dernière sauvegarde il y a ${daysSinceExport} jours`}</strong><p>Enregistre une copie dans Fichiers, au cas où.</p></div><button className="btn btn-secondary btn-small" onClick={exportData}><Icon name="download" size={18} />Sauvegarder</button></div>}
       {!store.history.length && !active && <div className="notice"><div><strong>Récupère ton historique</strong><p>Importe ta dernière sauvegarde (.json) pour retrouver tes séances et tes perfs.</p></div><button className="btn btn-primary btn-small" onClick={() => fileInputRef.current?.click()}><Icon name="upload" size={18} />Importer</button></div>}
 
       <div className="actions">
@@ -439,7 +546,10 @@ export default function App() {
             <button className="btn btn-text" onClick={() => setTab("program")}>Choisir une routine</button>
           </> : currentPlan && <>
             <button className="btn btn-primary btn-large" onClick={() => startPlan(currentPlan, true)}><Icon name="play" size={18} />Commencer la séance</button>
-            <button className="btn btn-text" onClick={() => setSheet({ type: "skip" })}>Je ne peux pas y aller</button>
+            <div className="split-actions">
+              <button className="btn btn-secondary" onClick={() => startPlan(makeExpressPlan(currentPlan), true, true)}><Icon name="clock" size={17} />Express · {makeExpressPlan(currentPlan).duration} min</button>
+              <button className="btn btn-quiet" onClick={() => setSheet({ type: "skip" })}>Pas de salle</button>
+            </div>
           </>}
       </div>
 
@@ -551,6 +661,10 @@ export default function App() {
       </div>
 
       {summaryView === "session" && (rows.length ? <>
+        {!active && newRecords.length > 0 && <section className="card records">
+          <div className="card-head"><h2>{newRecords.length > 1 ? `${newRecords.length} nouveaux records` : "Nouveau record"}</h2></div>
+          <div className="rows">{newRecords.map((item) => <div className="row" key={item.name}><span>{item.name}</span><strong>{item.value} {item.unit} <small>avant {item.before}</small></strong></div>)}</div>
+        </section>}
         <section className="card">
           <div className="card-head"><h2>{active ? active.plan.title : lastSession?.title}</h2><span>{active ? "En cours" : lastSession ? `${formatShortDate(lastSession.date)}${lastSession.durationMin ? ` · ${lastSession.durationMin} min` : ""}` : ""}</span></div>
           <div className="stats">
@@ -573,6 +687,7 @@ export default function App() {
               : <div className="row summary-row" key={row.key}>{content}</div>;
           })}</div>
         </section>
+        {(active || lastSession) && <label className="note-field"><span>Note de séance</span><textarea rows={2} placeholder="Ex. épaule gauche sensible, salle bondée…" value={active ? active.note ?? "" : lastSession?.note ?? ""} onChange={(event) => active ? setActiveNote(event.target.value) : lastSession && updateRecord(lastSession.id, (record) => ({ ...record, note: event.target.value }))} /></label>}
         {active && <button className="btn btn-secondary" onClick={() => setTab("workout")}>Retour à la séance</button>}
       </> : <div className="empty"><strong>Rien à résumer pour l’instant.</strong><p>Ta prochaine séance apparaîtra ici.</p></div>)}
 
@@ -599,11 +714,11 @@ export default function App() {
       </>}
 
       {summaryView === "journal" && <section className="card">
-        {store.history.length ? <div className="rows">{[...store.history].reverse().slice(0, 40).map((record) => <div className={`row journal-row ${record.kind}`} key={record.id}>
+        {store.history.length ? <div className="rows">{[...store.history].reverse().slice(0, 40).map((record) => <button className={`row row-button journal-row ${record.kind}`} key={record.id} onClick={() => setSheet({ type: "record", id: record.id })}>
           <span className="journal-icon"><Icon name={record.kind === "rest" ? "moon" : record.kind === "missed" ? "skip" : "check"} size={16} stroke={2.2} /></span>
-          <span className="grow"><strong>{record.title}</strong><small>{formatShortDate(record.date)} · S{record.blockWeek} J{record.cycleDay}</small></span>
+          <span className="grow"><strong>{record.title}</strong><small>{formatShortDate(record.date)} · S{record.blockWeek} J{record.cycleDay}{record.note ? ` · ${record.note}` : ""}</small></span>
           <em>{record.kind === "missed" ? "Manquée" : record.kind === "rest" ? "Repos" : record.durationMin ? `${record.durationMin} min` : `${record.completedSteps}/${record.totalSteps}`}</em>
-        </div>)}</div> : <div className="empty"><strong>Journal vide.</strong></div>}
+        </button>)}</div> : <div className="empty"><strong>Journal vide.</strong></div>}
       </section>}
     </div>;
   };
@@ -670,8 +785,9 @@ export default function App() {
     const isLast = groupIndex === groups.length - 1;
     const minutes = Math.round((active.activeMs ?? 0) / 60000);
     const blockKind = step.blockKind === "superset" ? "Superset" : step.blockKind === "circuit" ? "Circuit" : step.blockKind === "challenge" ? "Challenge" : step.blockLabel;
-    const previousVariant = previous?.results.map((result) => result.variant.trim()).find(Boolean) ?? "";
-    const timerVisible = timerRunning || timerSeconds > 0;
+    const previousVariant = previous?.results.map((result) => result.variant.trim()).find((value) => value && !/^[0\-–—.]+$/.test(value)) ?? "";
+    const timerVisible = Boolean(restEndAt);
+    const timerLabel = active.restLabel ?? "Repos";
     const nextGroup = groups[groupIndex + 1];
 
     return <div className="workout">
@@ -700,6 +816,7 @@ export default function App() {
           <div><small>{previous ? `Dernière fois · ${formatShortDate(previous.record.date)}` : "Dernière fois"}</small><strong>{previous ? previousLine(previous) : "Première fois"}</strong>{previous && previousDetails(previous) && <span>{previousDetails(previous)}</span>}</div>
           {best && <div className="record"><small>Record</small><strong>{best.value}</strong></div>}
         </div>}
+        {hint && <div className="hint"><strong>{hint.title}</strong><p>{hint.text}</p></div>}
 
         {isChallenge ? <section className="card challenge">
           <div className="challenge-total"><div><small>Total</small><strong>{step.result.miniSets.reduce((sum, value) => sum + (Number(value) || 0), 0)}</strong></div><button className="btn btn-secondary btn-small" onClick={() => startRest(420, "Bloc 7 min")}><Icon name="clock" size={16} />Lancer 7 min</button></div>
@@ -715,7 +832,7 @@ export default function App() {
             const firstOpen = group.entries.find(({ step: entry }) => !entry.result.done)?.index === index;
             return <div key={item.stepId} className={`set-grid ${showBallast ? "with-ballast" : ""} ${item.result.done ? "done" : ""} ${firstOpen ? "current" : ""}`}>
               <span className="set-number">{item.round}</span>
-              {item.result.done ? <span className="set-value"><strong>{item.result.value || "—"}</strong><Delta value={delta} /></span>
+              {item.result.done ? <span className="set-value"><strong>{item.result.value || "—"}</strong>{best && current !== null && current > best.value ? <span className="delta record-badge">Record</span> : <Delta value={delta} />}</span>
                 : <label className="set-input"><span className="sr-only">{item.name} série {item.round}</span><input inputMode="decimal" value={item.result.value} placeholder={prevSet?.value != null ? String(prevSet.value) : item.target.match(/\d+/)?.[0] ?? "0"} onChange={(event) => updateResult(index, "value", event.target.value)} /></label>}
               {showBallast && (item.result.done ? <span className="set-muted">{item.result.ballast ? `+${item.result.ballast}` : "—"}</span>
                 : <label className="set-input light"><span className="sr-only">Lest série {item.round}</span><input inputMode="decimal" value={item.result.ballast} placeholder={prevSet?.ballast ? String(prevSet.ballast) : "0"} onChange={(event) => updateResult(index, "ballast", event.target.value)} /></label>)}
@@ -744,8 +861,8 @@ export default function App() {
 
       <div className="workout-bar">
         {timerVisible ? <div className="rest-bar">
-          <div className="grow"><small>{timerLabel}{nextGroup && timerLabel === "Repos" && allDone ? ` · puis ${nextGroup.entries[0].step.name.replace("Progression ", "")}` : ""}</small><strong>{formatTimer(timerSeconds)}</strong></div>
-          <button className="rest-ghost" onClick={() => { setTimerSeconds(timerSeconds + 15); setTimerRunning(true); }}>+15</button>
+          <div className="grow"><small>{timerLabel}{nextGroup && timerLabel === "Repos" && allDone ? ` · puis ${nextGroup.entries[0].step.name.replace("Progression ", "")}` : ""}</small><strong>{formatTimer(restRemaining)}</strong></div>
+          <button className="rest-ghost" onClick={() => addRest(15)}>+15</button>
           <button className="rest-main" onClick={resetTimer}>Passer</button>
         </div> : <div className="nav-bar">
           <button className="icon-button" aria-label="Exercice précédent" disabled={groupIndex === 0} onClick={() => goToGroup(groupIndex - 1)}><Icon name="back" /></button>
@@ -783,7 +900,8 @@ export default function App() {
         <span className="sheet-grabber" />
         {sheet.type === "skip" && currentPlan && <>
           <h2>Pas de salle aujourd’hui ?</h2>
-          <p>Aucune des deux options ne crée de fausse séance.</p>
+          <p>Aucune option ne crée de fausse séance.</p>
+          <button className="sheet-option" onClick={() => startPlan(makeExpressPlan(currentPlan), true, true)}><strong>Faire la version express</strong><small>≈ {makeExpressPlan(currentPlan).duration} min, l’essentiel seulement. Compte comme la séance du jour.</small></button>
           <button className="sheet-option" onClick={() => setSheet(null)}><strong>La garder pour plus tard</strong><small>{currentPlan.title} reste ta prochaine séance.</small></button>
           <button className="sheet-option" onClick={markMissed}><strong>La marquer comme manquée</strong><small>Le planning passe au jour {store.cycleDay % 7 + 1}. Hors stats et hors perfs.</small></button>
           <button className="btn btn-text" onClick={() => setSheet(null)}>Annuler</button>
@@ -811,6 +929,24 @@ export default function App() {
               <Icon name="chevron" size={16} />
             </button>;
           })}</div>
+          <label className="note-field"><span>Note de séance</span><textarea rows={2} placeholder="Ex. épaule gauche sensible…" value={active.note ?? ""} onChange={(event) => setActiveNote(event.target.value)} /></label>
+        </>}
+        {sheet.type === "record" && editedRecord && <>
+          <h2>{editedRecord.title}</h2>
+          <p>{formatShortDate(editedRecord.date)} · S{editedRecord.blockWeek} J{editedRecord.cycleDay}{editedRecord.durationMin ? ` · ${editedRecord.durationMin} min` : ""}</p>
+          {isTrainingRecord(editedRecord) && editedRecord.results.some((result) => result.tracking === "reps" || result.tracking === "seconds") && <div className="record-editor">
+            {[...new Set(editedRecord.results.map((result) => result.exerciseId))].map((exerciseId) => {
+              const entries = editedRecord.results.map((result, index) => ({ result, index })).filter(({ result }) => result.exerciseId === exerciseId && (result.tracking === "reps" || result.tracking === "seconds"));
+              if (!entries.length) return null;
+              return <div className="record-exercise" key={exerciseId}>
+                <strong>{entries[0].result.exerciseName}</strong>
+                <div className="record-sets">{entries.map(({ result, index }) => <label key={index}><span>S{result.series}</span><input inputMode="decimal" value={result.value ?? ""} placeholder="—" onChange={(event) => updateRecordResult(editedRecord.id, index, "value", event.target.value)} /></label>)}</div>
+              </div>;
+            })}
+          </div>}
+          {isTrainingRecord(editedRecord) && <label className="note-field"><span>Note</span><textarea rows={2} value={editedRecord.note ?? ""} placeholder="Aucune note" onChange={(event) => updateRecord(editedRecord.id, (record) => ({ ...record, note: event.target.value }))} /></label>}
+          <button className="btn btn-primary" onClick={() => setSheet(null)}>Fermer</button>
+          <button className="btn btn-text danger" onClick={() => deleteRecord(editedRecord.id)}>Supprimer cette entrée</button>
         </>}
       </section>
     </div>}

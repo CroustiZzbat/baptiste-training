@@ -70,6 +70,11 @@ export type ActiveSession = {
   /** Temps d'entraînement réel cumulé (ms) : les pauses de plus de 20 min ne comptent pas. */
   activeMs?: number;
   lastActivityAt?: number;
+  /** Fin du repos en cours (timestamp) : le chrono reste juste même écran verrouillé. */
+  restEndAt?: number | null;
+  restLabel?: string;
+  note?: string;
+  express?: boolean;
 };
 
 export type SavedExerciseResult = {
@@ -100,6 +105,8 @@ export type SessionRecord = {
   completedSteps: number;
   totalSteps: number;
   results: SavedExerciseResult[];
+  note?: string;
+  express?: boolean;
 };
 
 export type Recovery = { sleep: number; energy: number; soreness: number };
@@ -115,6 +122,8 @@ export type Store = {
   levels: Record<LevelKey, 1 | 2 | 3>;
   recovery: Recovery;
   skillLogs: SkillLog[];
+  /** Date ISO du dernier export de sauvegarde. */
+  lastExportAt?: string;
 };
 
 export const STORAGE_KEY = "baptiste-training-v3";
@@ -562,4 +571,67 @@ export function personalBest(history: SessionRecord[], exerciseId: string) {
 
 export function formatShortDate(date: string) {
   return new Intl.DateTimeFormat("fr-FR", { day: "numeric", month: "short" }).format(new Date(`${date}T12:00:00`));
+}
+
+/* ------------------------------------------------------------------ */
+/* Séance express & suggestions de progression                         */
+/* ------------------------------------------------------------------ */
+
+/** Version courte (≈ 30–35 min) : pas de blocs « check », 3 séries max, 3 blocs max, 3 exercices max au challenge. */
+export function makeExpressPlan(plan: Plan): Plan {
+  const blocks = plan.blocks
+    .filter((block) => block.exercises.some((item) => item.tracking !== "check"))
+    .slice(0, 3)
+    .map((block) => block.kind === "challenge"
+      ? { ...block, label: "3 exercices · 7 minutes chacun", exercises: block.exercises.slice(0, 3) }
+      : { ...block, rounds: Math.min(block.rounds, 3), roundsLabel: `${Math.min(block.rounds, 3)} séries` });
+  const fullSteps = flattenPlan(plan).length;
+  const expressSteps = flattenPlan({ ...plan, blocks }).length;
+  return {
+    ...plan,
+    title: `${plan.title} · express`,
+    shortTitle: `${plan.shortTitle} express`,
+    duration: Math.max(25, Math.round((plan.duration * expressSteps) / Math.max(fullSteps, 1))),
+    blocks,
+  };
+}
+
+/** Haut de la fourchette d'objectif (« 6–12 reps » → 12, « 20–30 s » → 30), null si pas de fourchette. */
+export function targetTop(target: string): number | null {
+  const range = target.match(/(\d+)\s*[–-]\s*(\d+)/);
+  if (range) return Number(range[2]);
+  const single = target.match(/^(\d+)\s*(reps|s)\b/);
+  return single ? Number(single[1]) : null;
+}
+
+export type ProgressionHint = { title: string; text: string };
+
+export function progressionHint(history: SessionRecord[], exercise: Exercise, level: number | null): ProgressionHint | null {
+  if (exercise.tracking !== "reps" && exercise.tracking !== "seconds") return null;
+  const sessions: SavedExerciseResult[][] = [];
+  for (let index = history.length - 1; index >= 0 && sessions.length < 3; index -= 1) {
+    const record = history[index];
+    if (!isTrainingRecord(record)) continue;
+    const results = record.results.filter((result) => result.exerciseId === exercise.id && result.value !== null);
+    if (results.length) sessions.push(results);
+  }
+  if (sessions.length < 2) return null;
+  const unit = exercise.tracking === "seconds" ? "s" : "reps";
+  const nextStep = exercise.levelKey && level !== null && level < 3
+    ? `Passe au niveau ${level + 1}.`
+    : exercise.loadMode === "weighted" || exercise.loadMode === "band_or_weight"
+      ? "Ajoute un peu de lest (≈ 2,5 kg) ou retire l’assistance."
+      : exercise.harder ? `${exercise.harder}.` : `Vise +1 ${unit} par série.`;
+  const top = targetTop(exercise.target);
+  if (top !== null && sessions.slice(0, 2).every((results) => results.every((result) => (result.value ?? 0) >= top))) {
+    return { title: "Prêt à monter d’un cran", text: `Haut de la fourchette (${top} ${unit}) atteint 2 séances de suite. ${nextStep}` };
+  }
+  if (sessions.length >= 3) {
+    const signature = (results: SavedExerciseResult[]) => results.map((result) => result.value).join("-");
+    const totals = sessions.map((results) => results.reduce((sum, result) => sum + (result.value ?? 0), 0));
+    if (new Set(sessions.map(signature)).size === 1 || (totals[0] <= totals[1] && totals[1] <= totals[2])) {
+      return { title: "Ça stagne", text: `Même total ou moins depuis 3 séances. Essaie +1 ${unit} sur la première série, garde le reste identique.` };
+    }
+  }
+  return null;
 }

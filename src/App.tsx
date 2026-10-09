@@ -1,4 +1,4 @@
-import type { CSSProperties, ReactNode } from "react";
+import type { ReactNode } from "react";
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   DAY_LABELS,
@@ -14,19 +14,19 @@ import {
   formatShortDate,
   formatTimer,
   isTrainingRecord,
+  lSitPlan,
   lastPerformance,
+  mainPlans,
+  makeAbsPlan,
+  makeFlexPlan,
   makeMissedRecord,
   makeRestRecord,
   migrateStore,
   personalBest,
-  skipToDay,
-  lSitPlan,
-  mainPlans,
-  makeAbsPlan,
-  makeFlexPlan,
   progressionExercises,
   recoveryStatus,
   skillMetrics,
+  skipToDay,
   toLocalDate,
   type AbsRoutineKey,
   type ActiveSession,
@@ -40,53 +40,16 @@ import {
   type Store,
 } from "./training-data";
 
-type Sheet =
-  | { type: "skip" }
-  | { type: "jump"; day: number }
-  | null;
+/* ------------------------------------------------------------------ */
+/* Types & helpers                                                     */
+/* ------------------------------------------------------------------ */
 
-/** Ajoute le temps écoulé depuis la dernière action, sans compter les longues pauses. */
-function bumpActivity(active: ActiveSession): ActiveSession {
-  const now = Date.now();
-  const last = active.lastActivityAt ?? active.startedAt;
-  return { ...active, activeMs: (active.activeMs ?? 0) + Math.max(0, Math.min(now - last, IDLE_GAP_MS)), lastActivityAt: now };
-}
-
-function unitFor(tracking: ActiveStep["tracking"]) {
-  return tracking === "seconds" ? "s" : "reps";
-}
-
-/** Résumé court de la dernière perf : « 6 · 6 · 6 · 4 reps » */
-function previousLine(previous: PreviousPerformance) {
-  const first = previous.results[0];
-  if (first.tracking === "challenge") {
-    const sets = first.challengeSets?.length ? ` (${first.challengeSets.join("-")})` : "";
-    return `${first.challengeTotal ?? 0} reps${sets}`;
-  }
-  if (first.tracking === "check") return [first.level ? `Niveau ${first.level}` : "Validé", first.variant.trim()].filter(Boolean).join(" · ");
-  const values = previous.results.map((result) => result.value).filter((value): value is number => value !== null);
-  return values.length ? `${values.join(" · ")} ${unitFor(first.tracking)}` : "—";
-}
-
-function previousDetails(previous: PreviousPerformance) {
-  const variants = [...new Set(previous.results.map((result) => result.variant.trim()).filter(Boolean))];
-  const ballasts = [...new Set(previous.results.map((result) => result.ballast).filter((value): value is number => value !== null && value > 0))];
-  const rpes = previous.results.map((result) => result.rpe).filter((value): value is number => value !== null);
-  return [
-    variants.length ? variants.join(", ") : null,
-    ballasts.length ? `+${ballasts.join("/")} kg` : null,
-    rpes.length ? `RPE ${Math.min(...rpes)}–${Math.max(...rpes)}`.replace(/RPE (\d+)–\1$/, "RPE $1") : null,
-  ].filter(Boolean).join(" · ");
-}
-
-type Tab = "home" | "program" | "workout" | "summary" | "progress" | "skills" | "more";
+type Tab = "home" | "program" | "summary" | "skills" | "settings" | "workout";
+type SummaryView = "session" | "progress" | "journal";
 type ProgressMetric = "best" | "average" | "total";
+type Sheet = { type: "skip" } | { type: "jump"; day: number } | { type: "exit" } | { type: "exercises" } | null;
 
-type ActiveExerciseGroup = {
-  key: string;
-  firstIndex: number;
-  entries: { index: number; step: ActiveStep }[];
-};
+type ExerciseGroup = { key: string; firstIndex: number; entries: { index: number; step: ActiveStep }[] };
 
 type SummaryRow = {
   key: string;
@@ -100,8 +63,11 @@ type SummaryRow = {
   status: "done" | "active" | "todo";
 };
 
-function groupActiveExercises(steps: ActiveStep[]): ActiveExerciseGroup[] {
-  const groups = new Map<string, ActiveExerciseGroup>();
+const LEVEL_LABELS: Record<LevelKey, string> = { handstand: "Handstand", hspu: "HSPU", dragon: "Dragon Flag", pistol: "Pistol Squat", lsit: "L-Sit" };
+const SHORT_DAY = ["Up 1", "Low 1", "Libre", "Up 2", "Libre", "5×7", "Libre"];
+
+function groupExercises(steps: ActiveStep[]): ExerciseGroup[] {
+  const groups = new Map<string, ExerciseGroup>();
   steps.forEach((step, index) => {
     const key = `${step.blockId}:${step.id}`;
     const current = groups.get(key);
@@ -111,103 +77,131 @@ function groupActiveExercises(steps: ActiveStep[]): ActiveExerciseGroup[] {
   return [...groups.values()];
 }
 
-function activeSummary(groups: ActiveExerciseGroup[], levels: Store["levels"]): SummaryRow[] {
+function groupDone(group: ExerciseGroup) {
+  return group.entries.every(({ step }) => step.result.done);
+}
+
+function activeSummary(groups: ExerciseGroup[], levels: Store["levels"]): SummaryRow[] {
   return groups.map((group) => {
-    const representative = group.entries[0].step;
-    const isChallenge = representative.tracking === "challenge";
-    const values = group.entries.flatMap(({ step }) => isChallenge
-      ? step.result.miniSets.filter((value) => value !== "").map(Number).filter(Number.isFinite)
-      : [Number(step.result.value)].filter((value) => step.result.value !== "" && Number.isFinite(value)));
+    const step = group.entries[0].step;
+    const isChallenge = step.tracking === "challenge";
+    const values = group.entries.flatMap(({ step: item }) => isChallenge
+      ? item.result.miniSets.filter((value) => value !== "").map(Number).filter(Number.isFinite)
+      : [Number(item.result.value)].filter((value) => item.result.value !== "" && Number.isFinite(value)));
     const completedSets = isChallenge
-      ? group.entries.reduce((sum, { step }) => sum + step.result.miniSets.filter((value) => value !== "").length, 0)
-      : group.entries.filter(({ step }) => step.result.done).length;
+      ? group.entries.reduce((sum, { step: item }) => sum + item.result.miniSets.filter((value) => value !== "").length, 0)
+      : group.entries.filter(({ step: item }) => item.result.done).length;
     const plannedSets = isChallenge ? null : group.entries.length;
-    const hasActivity = completedSets > 0 || values.length > 0;
-    const isDone = isChallenge
-      ? group.entries.every(({ step }) => step.result.done)
-      : completedSets === plannedSets;
+    const done = isChallenge ? groupDone(group) : completedSets === plannedSets;
     return {
-      key: group.key,
-      name: representative.name,
-      tracking: representative.tracking,
-      plannedSets,
-      completedSets,
+      key: group.key, name: step.name, tracking: step.tracking, plannedSets, completedSets,
       total: values.length ? values.reduce((sum, value) => sum + value, 0) : null,
       best: values.length ? Math.max(...values) : null,
-      level: representative.levelKey ? levels[representative.levelKey] : null,
-      status: isDone ? "done" : hasActivity ? "active" : "todo",
+      level: step.levelKey ? levels[step.levelKey] : null,
+      status: done ? "done" : completedSets || values.length ? "active" : "todo",
     };
   });
 }
 
 function completedSummary(record: SessionRecord): SummaryRow[] {
   const groups = new Map<string, SessionRecord["results"]>();
-  record.results.forEach((result) => {
-    const current = groups.get(result.exerciseId) ?? [];
-    current.push(result);
-    groups.set(result.exerciseId, current);
-  });
+  record.results.forEach((result) => groups.set(result.exerciseId, [...(groups.get(result.exerciseId) ?? []), result]));
   return [...groups.entries()].map(([key, results]) => {
-    const representative = results[0];
-    const values = results
-      .map((result) => result.challengeTotal ?? result.value)
-      .filter((value): value is number => value !== null && Number.isFinite(value));
-    const completedSets = representative.tracking === "challenge"
-      ? results.reduce((sum, result) => sum + (result.challengeSets?.length ?? (result.challengeTotal !== null ? 1 : 0)), 0)
+    const first = results[0];
+    const values = results.map((result) => result.challengeTotal ?? result.value).filter((value): value is number => value !== null && Number.isFinite(value));
+    const completedSets = first.tracking === "challenge"
+      ? results.reduce((sum, result) => sum + (result.challengeSets?.length ?? 0), 0)
       : results.filter((result) => result.done).length;
     return {
-      key,
-      name: representative.exerciseName,
-      tracking: representative.tracking,
-      plannedSets: representative.tracking === "challenge" ? null : results.length,
-      completedSets,
+      key, name: first.exerciseName, tracking: first.tracking,
+      plannedSets: first.tracking === "challenge" ? null : results.length, completedSets,
       total: values.length ? values.reduce((sum, value) => sum + value, 0) : null,
       best: values.length ? Math.max(...values) : null,
-      level: representative.level,
+      level: first.level,
       status: results.every((result) => result.done) ? "done" : completedSets ? "active" : "todo",
     };
   });
 }
 
-function Icon({ name, size = 20 }: { name: "home" | "program" | "play" | "summary" | "chart" | "skill" | "more" | "check" | "clock" | "arrow" | "download" | "upload" | "moon" | "flame" | "skip" | "history"; size?: number }) {
-  const paths: Record<string, ReactNode> = {
-    home: <><path d="M3 10.5 12 3l9 7.5" /><path d="M5 9.8V21h14V9.8" /><path d="M9 21v-7h6v7" /></>,
+function bumpActivity(active: ActiveSession): ActiveSession {
+  const now = Date.now();
+  const last = active.lastActivityAt ?? active.startedAt;
+  return { ...active, activeMs: (active.activeMs ?? 0) + Math.max(0, Math.min(now - last, IDLE_GAP_MS)), lastActivityAt: now };
+}
+
+function unitFor(tracking: ActiveStep["tracking"]) {
+  return tracking === "seconds" ? "s" : "reps";
+}
+
+function previousLine(previous: PreviousPerformance) {
+  const first = previous.results[0];
+  if (first.tracking === "challenge") return `${first.challengeTotal ?? 0} reps`;
+  if (first.tracking === "check") return [first.level ? `Niveau ${first.level}` : "Validé", first.variant.trim()].filter(Boolean).join(" · ");
+  const values = previous.results.map((result) => result.value).filter((value): value is number => value !== null);
+  if (!values.length) return "—";
+  return first.tracking === "seconds" ? `${values.join(" · ")} s` : values.join(" · ");
+}
+
+function previousDetails(previous: PreviousPerformance) {
+  const variants = [...new Set(previous.results.map((result) => result.variant.trim()).filter(Boolean))];
+  const ballasts = [...new Set(previous.results.map((result) => result.ballast).filter((value): value is number => value !== null && value > 0))];
+  const challengeSets = previous.results[0].challengeSets;
+  return [
+    challengeSets?.length ? challengeSets.join("-") : null,
+    variants.length ? variants.join(", ") : null,
+    ballasts.length ? `+${ballasts.join("/")} kg` : null,
+  ].filter(Boolean).join(" · ");
+}
+
+function formatLongDate(date: Date) {
+  const text = new Intl.DateTimeFormat("fr-FR", { weekday: "long", day: "numeric", month: "long" }).format(date);
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+type IconName = "home" | "program" | "chart" | "levels" | "gear" | "play" | "check" | "close" | "list" | "arrow" | "back" | "chevron" | "upload" | "download" | "moon" | "skip" | "clock" | "plus";
+
+function Icon({ name, size = 22, stroke = 1.9 }: { name: IconName; size?: number; stroke?: number }) {
+  const paths: Record<IconName, ReactNode> = {
+    home: <><path d="M3 10.5 12 3l9 7.5" /><path d="M5 9.8V21h14V9.8" /></>,
     program: <><path d="M5 4h14v16H5z" /><path d="M8 8h8M8 12h8M8 16h5" /></>,
-    play: <path d="M8 5.5v13l10-6.5-10-6.5Z" />,
-    summary: <><path d="M8 6h13M8 12h13M8 18h13" /><path d="M3 6h.01M3 12h.01M3 18h.01" /></>,
     chart: <><path d="M4 20V10" /><path d="M10 20V4" /><path d="M16 20v-7" /><path d="M22 20H2" /></>,
-    skill: <><path d="M12 3v18" /><path d="m5 8 7-5 7 5" /><path d="m6 16 6 5 6-5" /><path d="M4 12h16" /></>,
-    more: <><circle cx="5" cy="12" r="1.2" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none" /><circle cx="19" cy="12" r="1.2" fill="currentColor" stroke="none" /></>,
+    levels: <><path d="m5 8 7-5 7 5" /><path d="m6 16 6 5 6-5" /><path d="M4 12h16" /></>,
+    gear: <><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" /></>,
+    play: <path d="M8 5.5v13l10-6.5-10-6.5Z" fill="currentColor" stroke="none" />,
     check: <path d="m5 12 4 4L19 6" />,
-    clock: <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>,
-    arrow: <><path d="M5 12h14" /><path d="m14 7 5 5-5 5" /></>,
-    download: <><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M4 20h16" /></>,
+    close: <path d="M6 6l12 12M18 6 6 18" />,
+    list: <path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" />,
+    arrow: <><path d="M5 12h14" /><path d="m13 6 6 6-6 6" /></>,
+    back: <path d="m15 5-7 7 7 7" />,
+    chevron: <path d="m9 6 6 6-6 6" />,
     upload: <><path d="M12 16V4" /><path d="m7 9 5-5 5 5" /><path d="M4 20h16" /></>,
+    download: <><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M4 20h16" /></>,
     moon: <path d="M20 15.5A8.5 8.5 0 0 1 8.5 4 8.5 8.5 0 1 0 20 15.5Z" />,
     skip: <><path d="M5 5.5v13l9-6.5-9-6.5Z" /><path d="M18 5v14" /></>,
-    history: <><path d="M3 12a9 9 0 1 0 3-6.7" /><path d="M3 4v5h5" /><path d="M12 8v4l3 2" /></>,
-    flame: <path d="M12 22c4 0 7-2.8 7-6.8 0-3.6-2.4-6-4.4-8.4-.4 2.4-1.6 3.6-2.8 4.2C12 8 11 5 8.6 2.5 8.8 6.4 5 9.2 5 15.2 5 19.2 8 22 12 22Z" />,
+    clock: <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>,
+    plus: <path d="M12 5v14M5 12h14" />,
   };
-  return <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
+  return <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={stroke} strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
 
-function AppLogo() {
-  return <div className="app-logo" aria-label="Baptiste Training"><span className="logo-mark"><span /></span><span className="logo-word">BAPTISTE<span>TRAINING</span></span></div>;
+function Delta({ value }: { value: number | null }) {
+  if (value === null) return null;
+  return <span className={`delta ${value > 0 ? "up" : value < 0 ? "down" : "same"}`}>{value > 0 ? `+${value}` : value === 0 ? "=" : value}</span>;
 }
 
-function workoutLabel(plan: Plan) {
-  if (plan.kind === "challenge") return "CHALLENGE";
-  if (plan.kind === "optional") return "FACULTATIF";
-  return "SÉANCE PRINCIPALE";
-}
+/* ------------------------------------------------------------------ */
+/* App                                                                 */
+/* ------------------------------------------------------------------ */
 
-export default function Home() {
+export default function App() {
   const [store, setStore] = useState<Store | null>(null);
   const [tab, setTab] = useState<Tab>("home");
+  const [sheet, setSheet] = useState<Sheet>(null);
   const [selectedPlanId, setSelectedPlanId] = useState(mainPlans[0].id);
+  const [summaryView, setSummaryView] = useState<SummaryView>("session");
   const [timerSeconds, setTimerSeconds] = useState(0);
   const [timerRunning, setTimerRunning] = useState(false);
-  const [timerLabel, setTimerLabel] = useState("Chrono de repos");
+  const [timerLabel, setTimerLabel] = useState("Repos");
   const [absKey, setAbsKey] = useState<AbsRoutineKey>("beginner");
   const [absEffort, setAbsEffort] = useState(45);
   const [absTransition, setAbsTransition] = useState(15);
@@ -219,23 +213,22 @@ export default function Home() {
   const [skillInputs, setSkillInputs] = useState<Record<string, string>>({});
   const [progressExerciseId, setProgressExerciseId] = useState("pull-explosive");
   const [progressMetric, setProgressMetric] = useState<ProgressMetric>("best");
-  const [sheet, setSheet] = useState<Sheet>(null);
+  const [tipsOpen, setTipsOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     try {
       const saved = window.localStorage.getItem(STORAGE_KEY);
       if (saved) { setStore(migrateStore(JSON.parse(saved))); return; }
-    } catch { /* A damaged local backup must not block the application. */ }
+    } catch { /* Une sauvegarde locale abîmée ne doit pas bloquer l'appli. */ }
     setStore(createDefaultStore());
   }, []);
-
-  useEffect(() => { if (store) window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store)); }, [store]);
+  useEffect(() => { if (store) { try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store)); } catch { /* stockage plein ou bloqué */ } } }, [store]);
   useEffect(() => { if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js").catch(() => undefined); }, []);
   useEffect(() => {
     if (!timerRunning || timerSeconds <= 0) return;
     const timer = window.setInterval(() => setTimerSeconds((value) => {
-      if (value <= 1) { setTimerRunning(false); return 0; }
+      if (value <= 1) { setTimerRunning(false); try { navigator.vibrate?.(300); } catch { /* iOS */ } return 0; }
       return value - 1;
     }), 1000);
     return () => window.clearInterval(timer);
@@ -245,209 +238,139 @@ export default function Home() {
   const flexPlan = useMemo(() => makeFlexPlan(flexKey, flexSets, flexHold, flexRest), [flexKey, flexSets, flexHold, flexRest]);
   const trackedExercises = useMemo(() => progressionExercises(), []);
 
-  if (!store) return <main className="loading-screen"><AppLogo /><div className="loading-line"><span /></div></main>;
+  if (!store) return <main className="loading"><span className="loading-dot" /></main>;
 
+  /* ---------- état dérivé ---------- */
   const complete = store.currentWeek > 6;
   const currentPlan = complete ? null : currentPlanForDay(store.cycleDay);
   const isRestDay = !complete && REST_DAYS.has(store.cycleDay);
   const absoluteDay = complete ? 42 : (store.currentWeek - 1) * 7 + store.cycleDay;
   const status = recoveryStatus(store.recovery);
-  const selectedPlan = mainPlans.find((plan) => plan.id === selectedPlanId) ?? mainPlans[0];
-  const activeExerciseGroups = store.active ? groupActiveExercises(store.active.steps) : [];
-  const activeExerciseIndex = store.active
-    ? Math.max(0, activeExerciseGroups.findIndex((group) => group.entries.some(({ index }) => index === store.active!.stepIndex)))
-    : 0;
-  const activeExercise = activeExerciseGroups[activeExerciseIndex] ?? null;
-  const activeStep = activeExercise?.entries[0]?.step ?? null;
-  const completedSteps = store.active?.steps.filter((step) => step.result.done).length ?? 0;
-  const plannedMain = store.history.filter((record) => record.kind === "main" || record.kind === "challenge").length;
-  const optionalCount = store.history.filter((record) => record.kind === "optional").length;
-  const restCount = store.history.filter((record) => record.kind === "rest").length;
+  const active = store.active;
+  const groups = active ? groupExercises(active.steps) : [];
+  const groupIndex = active ? Math.max(0, groups.findIndex((group) => group.entries.some(({ index }) => index === active.stepIndex))) : 0;
+  const group = groups[groupIndex] ?? null;
+  const step = group?.entries[0]?.step ?? null;
+  const previous = step ? lastPerformance(store.history, step.id) : null;
+  const best = step ? personalBest(store.history, step.id) : null;
+  const staleActive = active && Date.now() - (active.lastActivityAt ?? active.startedAt) > 6 * 3600 * 1000;
+  const mainDone = store.history.filter((record) => record.kind === "main" || record.kind === "challenge").length;
   const missedCount = store.history.filter((record) => record.kind === "missed").length;
-  const staleActive = store.active && Date.now() - (store.active.lastActivityAt ?? store.active.startedAt) > 6 * 3600 * 1000;
-  const weeklyCounts = Array.from({ length: 6 }, (_, index) => store.history.filter((record) => record.blockWeek === index + 1 && (record.kind === "main" || record.kind === "challenge")).length);
-  const lastCompletedSession = [...store.history].reverse().find(isTrainingRecord) ?? null;
-  const summaryRows = store.active
-    ? activeSummary(activeExerciseGroups, store.levels)
-    : lastCompletedSession ? completedSummary(lastCompletedSession) : [];
-  const summaryDoneSets = summaryRows.reduce((sum, row) => sum + row.completedSets, 0);
-  const summaryPlannedSets = summaryRows.reduce((sum, row) => sum + (row.plannedSets ?? 0), 0);
-  const summaryDoneExercises = summaryRows.filter((row) => row.status === "done").length;
-  const summaryTotalReps = summaryRows
-    .filter((row) => row.tracking === "reps" || row.tracking === "challenge")
-    .reduce((sum, row) => sum + (row.total ?? 0), 0);
-
-  const activePrevious = activeStep ? lastPerformance(store.history, activeStep.id) : null;
-  const activeBest = activeStep ? personalBest(store.history, activeStep.id) : null;
+  const weekRecords = store.history.filter((record) => record.blockWeek === store.currentWeek);
+  const weekMainDone = weekRecords.filter((record) => record.kind === "main" || record.kind === "challenge").length;
+  const lastSession = [...store.history].reverse().find(isTrainingRecord) ?? null;
+  const selectedPlan = mainPlans.find((plan) => plan.id === selectedPlanId) ?? mainPlans[0];
   const jumpTarget = sheet?.type === "jump" ? sheet.day : null;
   const jumpSkipped = jumpTarget ? Array.from({ length: jumpTarget - store.cycleDay }, (_, index) => store.cycleDay + index) : [];
 
-  const progressExercise = trackedExercises.find((item) => item.id === progressExerciseId) ?? trackedExercises[0];
-  const progressByWeek = Array.from({ length: 6 }, (_, index) => {
-    const results = store.history
-      .filter((record) => record.blockWeek === index + 1)
-      .flatMap((record) => record.results)
-      .filter((result) => result.exerciseId === progressExercise.id && result.done)
-      .map((result) => result.challengeTotal ?? result.value)
-      .filter((value): value is number => value !== null && Number.isFinite(value));
-    if (!results.length) return { week: index + 1, best: null, average: null, total: null };
-    return {
-      week: index + 1,
-      best: Math.max(...results),
-      average: Math.round((results.reduce((sum, value) => sum + value, 0) / results.length) * 10) / 10,
-      total: results.reduce((sum, value) => sum + value, 0),
-    };
-  });
-  const plottedValues = progressByWeek.map((week) => week[progressMetric]);
-  const numericValues = plottedValues.filter((value): value is number => value !== null);
-  const chartMax = Math.max(...numericValues, 1);
-  const firstValue = numericValues[0] ?? null;
-  const lastValue = numericValues.at(-1) ?? null;
-  const change = firstValue !== null && lastValue !== null ? Math.round((lastValue - firstValue) * 10) / 10 : null;
-  const unit = progressExercise.tracking === "seconds" ? "s" : "reps";
+  /* ---------- actions ---------- */
+  const resetTimer = () => { setTimerRunning(false); setTimerSeconds(0); };
+  const startRest = (seconds: number, label = "Repos") => { if (seconds <= 0) return; setTimerLabel(label); setTimerSeconds(seconds); setTimerRunning(true); };
 
   const startPlan = (plan: Plan, advancesPlan: boolean) => {
-    if (store.active && !window.confirm("Une séance est déjà en cours. La remplacer ?")) return;
+    if (active && !window.confirm(`« ${active.plan.title} » est en cours. La remplacer ?`)) return;
     setStore({ ...store, active: { plan, startedAt: Date.now(), stepIndex: 0, steps: flattenPlan(plan), warmupDone: false, advancesPlan, activeMs: 0, lastActivityAt: Date.now() } });
-    setTimerRunning(false);
-    setTimerSeconds(0);
+    resetTimer();
     setTab("workout");
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    window.scrollTo({ top: 0 });
   };
 
-  const updateStepAt = (stepIndex: number, updater: (step: ActiveStep) => ActiveStep) => {
-    setStore((current) => {
-      if (!current?.active) return current;
-      return { ...current, active: bumpActivity({ ...current.active, steps: current.active.steps.map((step, index) => index === stepIndex ? updater(step) : step) }) };
-    });
+  const updateSteps = (mapper: (step: ActiveStep, index: number) => ActiveStep) => {
+    setStore((current) => !current?.active ? current : { ...current, active: bumpActivity({ ...current.active, steps: current.active.steps.map(mapper) }) });
+  };
+  const updateResult = (stepIndex: number, field: "value" | "ballast", value: string) =>
+    updateSteps((item, index) => index === stepIndex ? { ...item, result: { ...item.result, [field]: value } } : item);
+  const setGroupVariant = (value: string) => {
+    if (!group) return;
+    const indexes = new Set(group.entries.map(({ index }) => index));
+    updateSteps((item, index) => indexes.has(index) ? { ...item, result: { ...item.result, variant: value } } : item);
+  };
+  const updateMiniSet = (stepIndex: number, setIndex: number, value: string) =>
+    updateSteps((item, index) => index === stepIndex ? { ...item, result: { ...item.result, miniSets: item.result.miniSets.map((entry, entryIndex) => entryIndex === setIndex ? value : entry) } } : item);
+  const addMiniSet = (stepIndex: number) =>
+    updateSteps((item, index) => index === stepIndex ? { ...item, result: { ...item.result, miniSets: [...item.result.miniSets, ""] } } : item);
+
+  const toggleSet = (stepIndex: number) => {
+    const target = active?.steps[stepIndex];
+    if (!target) return;
+    const wasDone = target.result.done;
+    const fallback = target.result.value === "" ? previous?.results.find((result) => result.series === target.round)?.value : null;
+    updateSteps((item, index) => index === stepIndex ? { ...item, result: { ...item.result, done: !wasDone, value: !wasDone && fallback != null ? String(fallback) : item.result.value } } : item);
+    if (!wasDone) startRest(target.restSec);
   };
 
-  const updateStepResult = (stepIndex: number, field: "value" | "ballast" | "variant" | "rpe", value: string) => {
-    updateStepAt(stepIndex, (step) => ({ ...step, result: { ...step.result, [field]: value } }));
+  const toggleGroup = () => {
+    if (!group || !step) return;
+    const allDone = groupDone(group);
+    const indexes = new Set(group.entries.map(({ index }) => index));
+    updateSteps((item, index) => indexes.has(index) ? { ...item, result: { ...item.result, done: !allDone } } : item);
+    if (!allDone && step.tracking !== "challenge") startRest(step.restSec);
   };
 
-  const updateMiniSet = (stepIndex: number, setIndex: number, value: string) => {
-    updateStepAt(stepIndex, (step) => ({ ...step, result: { ...step.result, miniSets: step.result.miniSets.map((item, itemIndex) => itemIndex === setIndex ? value : item) } }));
-  };
-
-  const addMiniSet = (stepIndex: number) => updateStepAt(stepIndex, (step) => ({ ...step, result: { ...step.result, miniSets: [...step.result.miniSets, ""] } }));
-
-  const validateStep = (stepIndex: number) => {
-    const step = store.active?.steps[stepIndex];
-    if (!step) return;
-    const wasDone = step.result.done;
-    updateStepAt(stepIndex, (currentStep) => ({ ...currentStep, result: { ...currentStep.result, done: !wasDone } }));
-    if (!wasDone && step.restSec > 0) {
-      setTimerLabel("Chrono de repos");
-      setTimerSeconds(step.restSec);
-      setTimerRunning(true);
-    }
-  };
-
-  const validateExercise = () => {
-    if (!activeExercise || !activeStep) return;
-    const allDone = activeExercise.entries.every(({ step }) => step.result.done);
-    const indexes = new Set(activeExercise.entries.map(({ index }) => index));
-    setStore((current) => !current?.active ? current : ({
-      ...current,
-      active: bumpActivity({
-        ...current.active,
-        steps: current.active.steps.map((step, index) => indexes.has(index) ? { ...step, result: { ...step.result, done: !allDone } } : step),
-      }),
-    }));
-    if (!allDone && activeStep.restSec > 0) {
-      setTimerLabel("Chrono de repos");
-      setTimerSeconds(activeStep.restSec);
-      setTimerRunning(true);
-    }
-  };
-
-  const moveExercise = (direction: -1 | 1) => {
-    const nextIndex = Math.min(Math.max(activeExerciseIndex + direction, 0), activeExerciseGroups.length - 1);
-    const nextExercise = activeExerciseGroups[nextIndex];
-    if (!nextExercise) return;
-    setStore((current) => !current?.active ? current : ({ ...current, active: { ...current.active, stepIndex: nextExercise.firstIndex } }));
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  };
-
-  const openExerciseFromSummary = (key: string) => {
-    const exerciseGroup = activeExerciseGroups.find((group) => group.key === key);
-    if (!exerciseGroup) return;
-    setStore((current) => !current?.active ? current : ({ ...current, active: { ...current.active, stepIndex: exerciseGroup.firstIndex } }));
-    setTab("workout");
-    window.scrollTo({ top: 0, behavior: "smooth" });
+  const goToGroup = (index: number) => {
+    const target = groups[Math.min(Math.max(index, 0), groups.length - 1)];
+    if (!target) return;
+    setStore((current) => !current?.active ? current : { ...current, active: { ...current.active, stepIndex: target.firstIndex } });
+    setTipsOpen(false);
+    setSheet(null);
+    window.scrollTo({ top: 0 });
   };
 
   const finishSession = () => {
     if (!store.active) return;
-    const active = bumpActivity(store.active);
-    const results: SavedExerciseResult[] = active.steps.map((step) => ({
-      exerciseId: step.id,
-      exerciseName: step.name,
-      tracking: step.tracking,
-      series: step.round,
-      value: step.result.value === "" ? null : Number(step.result.value),
-      ballast: step.result.ballast === "" ? null : Number(step.result.ballast),
-      variant: step.result.variant,
-      rpe: step.result.rpe === "" ? null : Number(step.result.rpe),
-      done: step.result.done,
-      level: step.levelKey ? store.levels[step.levelKey] : null,
-      challengeTotal: step.tracking === "challenge" ? step.result.miniSets.reduce((sum, value) => sum + (Number(value) || 0), 0) : null,
-      challengeSets: step.tracking === "challenge" ? step.result.miniSets.filter((value) => value !== "").map(Number).filter(Number.isFinite) : undefined,
+    const session = bumpActivity(store.active);
+    const results: SavedExerciseResult[] = session.steps.map((item) => ({
+      exerciseId: item.id,
+      exerciseName: item.name,
+      tracking: item.tracking,
+      series: item.round,
+      value: item.result.value === "" ? null : Number(item.result.value),
+      ballast: item.result.ballast === "" ? null : Number(item.result.ballast),
+      variant: item.result.variant,
+      rpe: item.result.rpe === "" ? null : Number(item.result.rpe),
+      done: item.result.done,
+      level: item.levelKey ? store.levels[item.levelKey] : null,
+      challengeTotal: item.tracking === "challenge" ? item.result.miniSets.reduce((sum, value) => sum + (Number(value) || 0), 0) : null,
+      challengeSets: item.tracking === "challenge" ? item.result.miniSets.filter((value) => value !== "").map(Number).filter(Number.isFinite) : undefined,
     }));
     const record: SessionRecord = {
-      id: `${active.plan.id}-${Date.now()}`,
-      planId: active.plan.id,
-      title: active.plan.title,
-      kind: active.plan.kind,
+      id: `${session.plan.id}-${Date.now()}`,
+      planId: session.plan.id,
+      title: session.plan.title,
+      kind: session.plan.kind,
       date: toLocalDate(new Date()),
-      durationMin: Math.max(1, Math.round((active.activeMs ?? 0) / 60000)),
+      durationMin: Math.max(1, Math.round((session.activeMs ?? 0) / 60000)),
       blockWeek: store.currentWeek,
       cycleDay: store.cycleDay,
-      completedSteps: active.steps.filter((step) => step.result.done).length,
-      totalSteps: active.steps.length,
+      completedSteps: session.steps.filter((item) => item.result.done).length,
+      totalSteps: session.steps.length,
       results,
     };
     const base = { ...store, history: [...store.history, record], active: null };
-    setStore(active.advancesPlan ? advanceCycle(base) : base);
-    setTimerRunning(false);
-    setTimerSeconds(0);
-    setTab("home");
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  };
-
-  const markRest = () => {
-    if (!isRestDay) return;
-    setStore(advanceCycle({ ...store, history: [...store.history, makeRestRecord(store)] }));
-  };
-
-  const markMissed = () => {
-    if (!currentPlan) return;
-    setStore(advanceCycle({ ...store, history: [...store.history, makeMissedRecord(store, currentPlan)] }));
+    setStore(session.advancesPlan ? advanceCycle(base) : base);
+    resetTimer();
     setSheet(null);
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  };
-
-  const jumpToDay = (day: number) => {
-    setStore(skipToDay(store, store.currentWeek, day));
-    setSheet(null);
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    setSummaryView("session");
+    setTab("summary");
+    window.scrollTo({ top: 0 });
   };
 
   const abandonSession = () => {
-    if (!store.active) return;
-    if (!window.confirm(`Abandonner « ${store.active.plan.title} » ? Rien ne sera enregistré.`)) return;
+    if (!store.active || !window.confirm(`Abandonner « ${store.active.plan.title} » ? Rien ne sera enregistré.`)) return;
     setStore({ ...store, active: null });
-    setTimerRunning(false);
-    setTimerSeconds(0);
+    resetTimer();
+    setSheet(null);
     setTab("home");
   };
 
+  const markRest = () => { if (isRestDay) setStore(advanceCycle({ ...store, history: [...store.history, makeRestRecord(store)] })); };
+  const markMissed = () => { if (currentPlan) setStore(advanceCycle({ ...store, history: [...store.history, makeMissedRecord(store, currentPlan)] })); setSheet(null); };
+  const jumpToDay = (day: number) => { setStore(skipToDay(store, store.currentWeek, day)); setSheet(null); };
   const setLevel = (key: LevelKey, level: 1 | 2 | 3) => setStore({ ...store, levels: { ...store.levels, [key]: level } });
 
   const saveSkill = (skillId: string) => {
     const value = Number(skillInputs[skillId]);
-    if (!Number.isFinite(value) || value < 0) return;
+    if (!Number.isFinite(value) || value <= 0) return;
     setStore({ ...store, skillLogs: [...store.skillLogs, { id: `${skillId}-${Date.now()}`, skillId, date: toLocalDate(new Date()), value }] });
     setSkillInputs({ ...skillInputs, [skillId]: "" });
   };
@@ -466,230 +389,430 @@ export default function Home() {
     if (!file) return;
     try {
       const parsed = migrateStore(JSON.parse(await file.text()));
-      if (store.history.length && !window.confirm(`Remplacer les ${store.history.length} entrées actuelles par cette sauvegarde (${parsed.history.length} entrées) ?`)) return;
+      if (store.history.length && !window.confirm(`Remplacer tes ${store.history.length} entrées par cette sauvegarde (${parsed.history.length} entrées) ?`)) return;
       setStore(parsed);
       setTab("home");
     } catch { window.alert("Ce fichier n’est pas une sauvegarde Baptiste Training valide."); }
     finally { event.target.value = ""; }
   };
 
-  const navItems: { id: Tab; label: string; icon: Parameters<typeof Icon>[0]["name"] }[] = [
-    { id: "home", label: "Accueil", icon: "home" },
-    { id: "program", label: "Programme", icon: "program" },
-    { id: "workout", label: "Séance", icon: "play" },
-    { id: "summary", label: "Bilan", icon: "summary" },
-    { id: "progress", label: "Progrès", icon: "chart" },
-    { id: "skills", label: "Niveaux", icon: "skill" },
-    { id: "more", label: "Plus", icon: "more" },
-  ];
+  /* ------------------------------------------------------------------ */
+  /* Écrans                                                              */
+  /* ------------------------------------------------------------------ */
 
-  return <main className="app-shell">
-    <aside className="sidebar">
-      <AppLogo />
-      <nav className="side-nav" aria-label="Navigation principale">{navItems.map((item) => <button key={item.id} className={tab === item.id ? "active" : ""} onClick={() => setTab(item.id)}><Icon name={item.icon} /><span>{item.label}</span></button>)}</nav>
-      <div className="sidebar-program"><span>PROGRAMME ACTUEL</span><strong>Bloc 1 · SWE 2</strong><p>{complete ? "Bloc terminé" : `Semaine ${store.currentWeek} sur 6 · Jour ${store.cycleDay}`}</p><div className="mini-progress"><span style={{ width: `${complete ? 100 : ((absoluteDay - 1) / 42) * 100}%` }} /></div></div>
-      <p className="privacy-note"><span /> Données locales uniquement</p>
-    </aside>
+  const header = (title: string, eyebrow?: string, back?: () => void) => <header className="page-header">
+    <div className="page-header-row">
+      {back ? <button className="icon-button" aria-label="Retour" onClick={back}><Icon name="back" /></button> : <span className="page-date">{formatLongDate(new Date())}</span>}
+      {!back && <button className="icon-button" aria-label="Réglages et sauvegarde" onClick={() => setTab("settings")}><Icon name="gear" size={20} /></button>}
+    </div>
+    {eyebrow && <p className="eyebrow">{eyebrow}</p>}
+    <h1>{title}</h1>
+  </header>;
 
-    <section className="content">
-      <header className="topbar">
-        <div className="mobile-logo"><AppLogo /></div>
-        <div className="topbar-date"><span>{complete ? "BLOC TERMINÉ" : `S${store.currentWeek} · J${absoluteDay}`}</span><strong>{complete ? "Bloc 1 validé" : `Jour ${store.cycleDay} · ${DAY_LABELS[store.cycleDay - 1]}`}</strong></div>
-        <div className="topbar-status"><span className={`status-dot ${status.level}`} /><div><small>RÉCUPÉRATION</small><strong>{status.label}</strong></div></div>
+  const renderHome = () => {
+    const planForPreview = currentPlan;
+    const previewRows = planForPreview
+      ? planForPreview.blocks.flatMap((block) => block.exercises).filter((item) => item.tracking !== "check")
+        .map((item) => ({ item, previous: lastPerformance(store.history, item.id) }))
+        .filter((row) => row.previous).slice(0, 4)
+      : [];
+    const previewDate = previewRows[0]?.previous?.record.date;
+    return <div className="page">
+      <header className="page-header">
+        <div className="page-header-row">
+          <span className="page-date">{formatLongDate(new Date())}</span>
+          <button className="icon-button" aria-label="Réglages et sauvegarde" onClick={() => setTab("settings")}><Icon name="gear" size={20} /></button>
+        </div>
+        <p className="eyebrow">{complete ? "Bloc 1 terminé" : `Semaine ${store.currentWeek} · Jour ${store.cycleDay}`}</p>
+        <h1>{complete ? "Bloc terminé" : isRestDay ? "Jour libre" : currentPlan?.title}</h1>
+        <p className="lead">{complete ? "Exporte ta sauvegarde avant de lancer le bloc suivant." : isRestDay ? "Repos complet, ou une routine légère si tu es frais." : `≈ ${currentPlan?.duration} min · ${currentPlan?.focus}`}</p>
       </header>
 
-      {tab === "home" && <div className="page home-page">
-        {staleActive && store.active && <section className="notice-card warning"><div><span>SÉANCE RESTÉE OUVERTE</span><strong>{store.active.plan.title} · commencée le {formatShortDate(toLocalDate(new Date(store.active.startedAt)))}</strong><p>Termine-la si tu l’as faite, sinon abandonne-la pour repartir proprement.</p></div><div className="notice-actions"><button className="secondary-button" onClick={() => setTab("workout")}>Ouvrir</button><button className="ghost-button" onClick={abandonSession}>Abandonner</button></div></section>}
-        {!store.history.length && !store.active && <section className="notice-card"><div><span>PREMIÈRE OUVERTURE</span><strong>Récupère ton historique</strong><p>Importe ta dernière sauvegarde (.json) pour retrouver tes séances, ta semaine en cours et tes perfs.</p></div><div className="notice-actions"><button className="primary-button" onClick={() => fileInputRef.current?.click()}><Icon name="upload" /> <span>Importer</span></button></div></section>}
-        <section className={`hero-card ${isRestDay ? "rest-hero" : ""}`}>
-          <div className="hero-copy">
-            <div className="eyebrow-row"><span className="eyebrow">{complete ? "42 JOURS VALIDÉS" : `BLOC 1 · SEMAINE ${store.currentWeek} · JOUR ${store.cycleDay}`}</span><span className={`readiness-pill ${status.level}`}>{status.label}</span></div>
-            <p className="overline">{complete ? "CYCLE TERMINÉ" : isRestDay ? "JOUR FLEXIBLE" : "PROCHAINE SÉANCE"}</p>
-            <h1>{complete ? <>Bloc 1 <span>terminé.</span></> : isRestDay ? <>Récupère, <span>ou choisis une routine.</span></> : <>Aujourd’hui, <span>{currentPlan?.title}.</span></>}</h1>
-            <p className="hero-description">{complete ? "Tes six semaines sont enregistrées. Exporte ta sauvegarde avant de passer au prochain bloc." : isRestDay ? `${status.text} Ce jour n’avance que lorsque tu valides ton repos ou termines une routine facultative.` : `${currentPlan?.focus}. ${status.text}`}</p>
-            <div className="hero-actions">
-              {store.active ? <button className="primary-button" onClick={() => setTab("workout")}><span>Reprendre {store.active.plan.shortTitle}</span><Icon name="arrow" /></button> : !complete && currentPlan ? <><button className="primary-button" onClick={() => startPlan(currentPlan, true)}><span>Commencer la séance</span><Icon name="arrow" /></button><button className="secondary-button" onClick={() => setSheet({ type: "skip" })}>Je ne peux pas y aller</button></> : isRestDay ? <><button className="primary-button" onClick={markRest}><span>Valider le repos</span><Icon name="check" /></button><button className="secondary-button" onClick={() => setTab("program")}>Choisir une routine</button></> : null}
-              {!isRestDay && currentPlan && <span className="duration"><Icon name="clock" size={17} /> ≈ {currentPlan.duration} min</span>}
-            </div>
-          </div>
-          <div className="hero-visual" aria-hidden="true"><div className="week-number">{complete ? "✓" : String(Math.min(store.currentWeek, 6)).padStart(2, "0")}</div><div className="visual-orbit orbit-one" /><div className="visual-orbit orbit-two" /><div className="visual-cross horizontal" /><div className="visual-cross vertical" /><span className="visual-caption">BLOC 01<br />SWE 2</span></div>
-        </section>
+      {staleActive && active && <div className="notice warning"><div><strong>Séance restée ouverte</strong><p>{active.plan.title}, commencée le {formatShortDate(toLocalDate(new Date(active.startedAt)))}.</p></div><div className="notice-actions"><button className="btn btn-quiet" onClick={() => setTab("workout")}>Ouvrir</button><button className="btn btn-quiet danger" onClick={abandonSession}>Abandonner</button></div></div>}
+      {!store.history.length && !active && <div className="notice"><div><strong>Récupère ton historique</strong><p>Importe ta dernière sauvegarde (.json) pour retrouver tes séances et tes perfs.</p></div><button className="btn btn-primary btn-small" onClick={() => fileInputRef.current?.click()}><Icon name="upload" size={18} />Importer</button></div>}
 
-        <section className="quick-stats">
-          <article><span className="stat-icon"><Icon name="check" /></span><div><strong>{plannedMain}<em>/24</em></strong><span>Séances principales{missedCount ? ` · ${missedCount} manquée${missedCount > 1 ? "s" : ""}` : ""}</span></div></article>
-          <article><span className="stat-icon purple"><Icon name="flame" /></span><div><strong>{optionalCount}</strong><span>Routines facultatives</span></div></article>
-          <article><span className="stat-icon blue"><Icon name="chart" /></span><div><strong>{Math.min(6, store.currentWeek)}<em>/6</em></strong><span>Semaine du bloc</span></div></article>
-          <article><span className="stat-icon orange"><Icon name="moon" /></span><div><strong>{restCount}</strong><span>Repos validés</span></div></article>
-        </section>
+      <div className="actions">
+        {active ? <button className="btn btn-primary btn-large" onClick={() => setTab("workout")}><Icon name="play" size={18} />Reprendre {active.plan.shortTitle}</button>
+          : complete ? <button className="btn btn-primary btn-large" onClick={exportData}><Icon name="download" size={20} />Exporter la sauvegarde</button>
+          : isRestDay ? <>
+            <button className="btn btn-primary btn-large" onClick={markRest}><Icon name="moon" size={20} />Valider le repos</button>
+            <button className="btn btn-text" onClick={() => setTab("program")}>Choisir une routine</button>
+          </> : currentPlan && <>
+            <button className="btn btn-primary btn-large" onClick={() => startPlan(currentPlan, true)}><Icon name="play" size={18} />Commencer la séance</button>
+            <button className="btn btn-text" onClick={() => setSheet({ type: "skip" })}>Je ne peux pas y aller</button>
+          </>}
+      </div>
 
-        {!complete && <section className="panel cycle-panel">
-          <div className="panel-heading"><div><span>PLANNING GLISSANT</span><h2>Ta semaine en 7 jours</h2></div><small>J{absoluteDay} EN COURS</small></div>
-          <p className="cycle-hint">Touche un jour à venir pour y aller directement : les séances sautées seront notées « manquées ».</p>
-          <div className="cycle-strip">{DAY_LABELS.map((label, index) => {
-            const day = index + 1;
-            return <button key={`${label}-${day}`} className={`cycle-day ${day < store.cycleDay ? "done" : ""} ${day === store.cycleDay ? "current" : ""}`} onClick={() => { if (day > store.cycleDay && !store.active) { setSheet({ type: "jump", day }); return; } const plan = currentPlanForDay(day); if (plan) { setSelectedPlanId(plan.id); setTab("program"); } }}><span>{day < store.cycleDay ? "✓" : `J${day}`}</span><strong>{label}</strong><small>{REST_DAYS.has(day) ? "Libre" : "Prévue"}</small></button>;
-          })}</div>
-        </section>}
-
-        {isRestDay && !store.active && <section className="optional-choices">
-          <article><span>01</span><h2>L-Sit intensif</h2><p>Force, technique et compression en supersets.</p><button onClick={() => startPlan(lSitPlan, true)}>Lancer</button></article>
-          <article><span>02</span><h2>Abdos</h2><p>Quatre niveaux, effort et nombre de tours réglables.</p><button onClick={() => setTab("program")}>Configurer</button></article>
-          <article><span>03</span><h2>Souplesse</h2><p>Trois routines, 30 à 60 secondes par position.</p><button onClick={() => setTab("program")}>Configurer</button></article>
-        </section>}
-      </div>}
-
-      {tab === "program" && <div className="page workout-library">
-        <div className="page-title"><span>BLOC 1 · 6 SEMAINES</span><h1>Le plan complet, <em>sans approximation.</em></h1><p>Quatre séances principales répétées pendant six semaines. Les jours 3, 5 et 7 restent libres.</p></div>
-        <div className="workout-tabs" role="tablist" aria-label="Choisir une séance">{mainPlans.map((plan) => <button key={plan.id} role="tab" aria-selected={selectedPlan.id === plan.id} className={selectedPlan.id === plan.id ? "active" : ""} onClick={() => setSelectedPlanId(plan.id)}><small>J{plan.scheduleDay} · chaque semaine</small><strong>{plan.title}</strong></button>)}</div>
-        <section className="workout-overview">
-          <div className="overview-heading"><div><span>J{selectedPlan.scheduleDay} · SEMAINES 1 À 6</span><h2>{selectedPlan.title}</h2><p>{selectedPlan.focus}</p></div><div className="overview-actions"><span><Icon name="clock" size={18} /> ≈ {selectedPlan.duration} min</span><button className="primary-button" onClick={() => startPlan(selectedPlan, currentPlan?.id === selectedPlan.id)}>{currentPlan?.id === selectedPlan.id ? "Lancer" : "Faire hors planning"} <Icon name="play" size={18} /></button></div></div>
-          <div className="warmup-line"><Icon name="check" size={17} /><span>{selectedPlan.warmup}</span></div>
-          <div className="plan-blocks">{selectedPlan.blocks.map((block) => <article className="plan-block" key={block.id}><div className="block-heading"><div><span>{block.kind === "superset" ? "SUPERSET" : block.kind === "circuit" ? "CIRCUIT" : block.kind === "challenge" ? "CHALLENGE" : "EXERCICE"}</span><strong>{block.label}</strong></div><small>{block.roundsLabel}</small></div>{block.exercises.map((item) => <div className="block-exercise" key={item.id}><div><strong>{item.name}</strong><small>{item.note}</small>{(() => { const previous = lastPerformance(store.history, item.id); return previous ? <small className="block-previous"><Icon name="history" size={12} /> {formatShortDate(previous.record.date)} : {previousLine(previous)}</small> : null; })()}</div><span>{item.target}</span><span>{item.restLabel}</span><span>{item.tempo}</span></div>)}</article>)}</div>
-        </section>
-
-        <div className="page-title optional-title"><span>JOURS 3, 5 ET 7</span><h1>Routines <em>facultatives.</em></h1><p>Elles remplacent le repos seulement si ta récupération permet d’être à 100 % sur la séance suivante.</p></div>
-        <section className="optional-builder-grid">
-          <article className="builder-card"><span className="builder-number">01</span><small>L-SIT</small><h2>L-Sit intensif</h2><p>Deux supersets de technique puis un circuit de compression.</p><div className="builder-summary"><span>≈ {lSitPlan.duration} min</span><span>4 blocs</span></div><button className="primary-button" onClick={() => startPlan(lSitPlan, isRestDay)}>Lancer la routine</button></article>
-          <article className="builder-card"><span className="builder-number">02</span><small>ABDOS</small><h2>{absRoutines[absKey].name}</h2><div className="builder-controls"><label>Routine<select value={absKey} onChange={(event) => setAbsKey(event.target.value as AbsRoutineKey)}>{Object.entries(absRoutines).map(([key, routine]) => <option key={key} value={key}>{routine.name}</option>)}</select></label><label>Effort<select value={absEffort} onChange={(event) => setAbsEffort(Number(event.target.value))}><option value={30}>30 s</option><option value={45}>45 s</option></select></label><label>Transition<select value={absTransition} onChange={(event) => setAbsTransition(Number(event.target.value))}><option value={30}>30 s</option><option value={15}>15 s</option></select></label><label>Tours<select value={absRounds} onChange={(event) => setAbsRounds(Number(event.target.value))}>{[2, 3, 4, 5].map((value) => <option key={value}>{value}</option>)}</select></label></div><div className="builder-summary"><span>≈ {absPlan.duration} min</span><span>{absRoutines[absKey].exercises.length} exercices</span></div><button className="primary-button" onClick={() => startPlan(absPlan, isRestDay)}>Lancer le circuit</button></article>
-          <article className="builder-card"><span className="builder-number">03</span><small>SOUPLESSE</small><h2>{flexibilityRoutines[flexKey].name}</h2><div className="builder-controls"><label>Routine<select value={flexKey} onChange={(event) => setFlexKey(event.target.value as FlexRoutineKey)}>{Object.entries(flexibilityRoutines).map(([key, routine]) => <option key={key} value={key}>{routine.name}</option>)}</select></label><label>Séries<select value={flexSets} onChange={(event) => setFlexSets(Number(event.target.value))}>{[3, 4, 5, 6].map((value) => <option key={value}>{value}</option>)}</select></label><label>Maintien<select value={flexHold} onChange={(event) => setFlexHold(Number(event.target.value))}>{[30, 45, 60].map((value) => <option key={value}>{value} s</option>)}</select></label><label>Repos<select value={flexRest} onChange={(event) => setFlexRest(Number(event.target.value))}>{[20, 40, 60].map((value) => <option key={value}>{value} s</option>)}</select></label></div><div className="builder-summary"><span>≈ {flexPlan.duration} min</span><span>{flexibilityRoutines[flexKey].exercises.length} positions</span></div><button className="primary-button" onClick={() => startPlan(flexPlan, isRestDay)}>Lancer la routine</button></article>
-        </section>
-      </div>}
-
-      {tab === "workout" && !store.active && <div className="page empty-workout"><div className="page-title"><span>MODE SÉANCE</span><h1>Aucune séance <em>en cours.</em></h1><p>Lance la séance prévue depuis l’accueil ou choisis une séance dans le programme.</p></div><button className="primary-button" onClick={() => setTab("home")}>Voir la séance du jour <Icon name="arrow" /></button></div>}
-
-      {tab === "workout" && store.active && activeStep && activeExercise && <div className="page active-session">
-        <div className="session-head"><div><span>{workoutLabel(store.active.plan)} · {store.active.advancesPlan ? "PLANNING ACTIF" : "HORS PLANNING"}</span><h1>{store.active.plan.title}</h1></div><div className="session-progress-copy"><strong>{completedSteps}<em>/{store.active.steps.length}</em></strong><span>SÉRIES VALIDÉES</span></div></div>
-        <div className="session-progress"><span style={{ width: `${(completedSteps / store.active.steps.length) * 100}%` }} /></div>
-        <button className={`warmup-card ${store.active.warmupDone ? "done" : ""}`} onClick={() => setStore({ ...store, active: store.active ? { ...store.active, warmupDone: !store.active.warmupDone } : null })}><span className="warmup-check"><Icon name="check" /></span><span><small>ÉCHAUFFEMENT</small><strong>{store.active.plan.warmup}</strong></span><em>{store.active.warmupDone ? "Effectué" : "À valider"}</em></button>
-        <div className="active-grid">
-          <section className="active-card">
-            <div className="active-card-top"><div><span className={`type-pill ${activeStep.category}`}>{activeStep.category === "challenge" ? "7 MIN" : activeStep.category}</span><small>{activeStep.blockLabel.toUpperCase()} · EXERCICE {activeExerciseIndex + 1}/{activeExerciseGroups.length}</small><h2>{activeStep.name}</h2><p>{activeStep.note ?? "Reste propre, respecte le tempo et arrête la série si l’exécution se dégrade."}</p></div><div className="target-box"><span>OBJECTIF PAR SÉRIE</span><strong>{activeStep.target}</strong><small>{activeStep.restLabel === "—" ? "Sans repos imposé" : `${activeStep.restLabel} de repos`}</small></div></div>
-            <div className="step-context"><span>{activeStep.tracking === "challenge" ? "SÉRIES LIBRES" : `${activeExercise.entries.length} SÉRIE${activeExercise.entries.length > 1 ? "S" : ""} AFFICHÉE${activeExercise.entries.length > 1 ? "S" : ""}`}</span><span>TEMPO · {activeStep.tempo}</span></div>
-            <div className={`previous-card ${activePrevious ? "" : "empty"}`}>
-              <div className="previous-main"><span><Icon name="history" size={14} /> DERNIÈRE FOIS{activePrevious ? ` · S${activePrevious.record.blockWeek} · ${formatShortDate(activePrevious.record.date)}` : ""}</span><strong>{activePrevious ? previousLine(activePrevious) : "Première fois sur cet exercice"}</strong>{activePrevious && previousDetails(activePrevious) && <small>{previousDetails(activePrevious)}</small>}</div>
-              {activeBest && activeStep.tracking !== "check" && <div className="previous-best"><span>RECORD</span><strong>{activeBest.value}<em> {unitFor(activeStep.tracking)}</em></strong><small>{formatShortDate(activeBest.date)}</small></div>}
-            </div>
-            {activeStep.levelKey && <div className="level-picker"><div><span>NIVEAU DE PROGRESSION</span><strong>Niveau {store.levels[activeStep.levelKey]}</strong></div><div>{([1, 2, 3] as const).map((level) => <button key={level} className={store.levels[activeStep.levelKey!] === level ? "active" : ""} onClick={() => setLevel(activeStep.levelKey!, level)}>{level}</button>)}</div></div>}
-
-            {activeStep.tracking === "challenge" ? <div className="challenge-entry"><div className="challenge-toolbar"><div><span>TOTAL ACTUEL</span><strong>{activeStep.result.miniSets.reduce((sum, value) => sum + (Number(value) || 0), 0)} reps</strong></div><button onClick={() => { setTimerLabel("Bloc de 7 minutes"); setTimerSeconds(420); setTimerRunning(true); }}>Démarrer 7 min</button></div><div className="mini-set-grid">{activeStep.result.miniSets.map((value, setIndex) => <label key={setIndex}><span>Série {setIndex + 1}</span><input inputMode="numeric" value={value} placeholder="0" onChange={(event) => updateMiniSet(activeExercise.firstIndex, setIndex, event.target.value)} /></label>)}<button className="add-set" onClick={() => addMiniSet(activeExercise.firstIndex)}>+ Ajouter une série</button></div><p>Aucun lest ici : fractionne librement les répétitions au poids du corps et bats ton total précédent.</p></div> : activeStep.tracking === "check" ? <div className="check-entry"><p>Cette progression est gérée de ton côté. Sélectionne ton niveau et valide lorsque ta routine est terminée.</p>{activeStep.loadMode === "variant" && <label><span>VARIANTE UTILISÉE</span><input value={activeStep.result.variant} placeholder="Optionnel" onChange={(event) => updateStepResult(activeExercise.firstIndex, "variant", event.target.value)} /></label>}</div> : (() => {
-              const showVariant = activeStep.loadMode === "variant" || activeStep.loadMode === "band_or_weight";
-              const showBallast = activeStep.loadMode === "weighted" || activeStep.loadMode === "band_or_weight";
-              const fieldCount = 2 + Number(showVariant) + Number(showBallast);
-              return <div className="set-table">
-                <div className={`set-row set-header fields-${fieldCount}`}><span>SÉRIE</span><span>{activeStep.tracking === "seconds" ? "TEMPS (S)" : "RÉPÉTITIONS"}</span>{showVariant && <span>VARIANTE / ASSISTANCE</span>}{showBallast && <span>LEST (KG)</span>}<span>RPE</span><span>FAIT</span></div>
-                {activeExercise.entries.map(({ index, step }) => {
-                  const previousSet = activePrevious?.results.find((result) => result.series === step.round && result.value !== null) ?? null;
-                  const current = step.result.value === "" ? null : Number(step.result.value);
-                  const delta = previousSet?.value != null && current !== null && Number.isFinite(current) ? Math.round((current - previousSet.value) * 10) / 10 : null;
-                  return <div className={`set-row fields-${fieldCount} ${step.result.done ? "done" : ""}`} key={step.stepId}>
-                  <span className="set-number">SÉRIE {step.round}{previousSet && <small className="set-previous">préc. {previousSet.value}{step.tracking === "seconds" ? " s" : ""}{previousSet.ballast ? ` +${previousSet.ballast} kg` : ""}</small>}{delta !== null && <em className={`set-delta ${delta > 0 ? "up" : delta < 0 ? "down" : "same"}`}>{delta > 0 ? `+${delta}` : delta === 0 ? "=" : delta}</em>}</span>
-                  <label><span className="mobile-field-label">{step.tracking === "seconds" ? "Temps (s)" : "Répétitions"}</span><input inputMode="decimal" aria-label={`${step.name}, série ${step.round}, ${step.tracking === "seconds" ? "temps" : "répétitions"}`} value={step.result.value} placeholder={previousSet?.value != null ? String(previousSet.value) : step.target.match(/\d+/)?.[0] ?? "0"} onChange={(event) => updateStepResult(index, "value", event.target.value)} /></label>
-                  {showVariant && <label><span className="mobile-field-label">Variante / assistance</span><input aria-label={`${step.name}, série ${step.round}, variante`} value={step.result.variant} placeholder={step.loadMode === "band_or_weight" ? "Ex. élastique rouge" : "Optionnel"} onChange={(event) => updateStepResult(index, "variant", event.target.value)} /></label>}
-                  {showBallast && <label><span className="mobile-field-label">Lest (kg)</span><input inputMode="decimal" aria-label={`${step.name}, série ${step.round}, lest`} value={step.result.ballast} placeholder="0" onChange={(event) => updateStepResult(index, "ballast", event.target.value)} /></label>}
-                  <label><span className="mobile-field-label">RPE</span><input inputMode="decimal" aria-label={`${step.name}, série ${step.round}, RPE`} value={step.result.rpe} placeholder="—" onChange={(event) => updateStepResult(index, "rpe", event.target.value)} /></label>
-                  <button className="set-check" aria-label={`${step.result.done ? "Réouvrir" : "Valider"} la série ${step.round}`} onClick={() => validateStep(index)}><Icon name="check" size={18} /></button>
-                </div>;
-                })}
-              </div>;
-            })()}
-
-            {(activeStep.easier || activeStep.harder) && <div className="difficulty-grid"><article><span>PLUS SIMPLE</span><p>{activeStep.easier ?? "—"}</p></article><article><span>PLUS DUR</span><p>{activeStep.harder ?? "—"}</p></article></div>}
-            <div className="validate-row"><button className={`validate-set ${activeExercise.entries.every(({ step }) => step.result.done) ? "done" : ""}`} onClick={validateExercise}><Icon name="check" />{activeExercise.entries.every(({ step }) => step.result.done) ? "Exercice validé" : `Valider toutes les séries`}</button></div>
-            <div className="exercise-navigation"><button disabled={activeExerciseIndex === 0} onClick={() => moveExercise(-1)}>← Exercice précédent</button>{activeExerciseIndex < activeExerciseGroups.length - 1 ? <button className="next-exercise" onClick={() => moveExercise(1)}>Exercice suivant <Icon name="arrow" size={17} /></button> : <button className="finish-button" onClick={finishSession}>Terminer la séance <Icon name="check" size={17} /></button>}</div>
-            <div className="abandon-row"><button onClick={abandonSession}>Abandonner la séance</button></div>
-          </section>
-          <aside className="session-aside"><div className={`timer-card ${timerRunning ? "running" : ""}`}><span>{timerLabel.toUpperCase()}</span><strong>{formatTimer(timerSeconds)}</strong><div className="timer-actions"><button onClick={() => setTimerRunning(!timerRunning)}>{timerRunning ? "Pause" : "Démarrer"}</button><button onClick={() => { setTimerSeconds(activeStep.restSec); setTimerRunning(false); }}>↻</button></div><div className="timer-presets">{[30, 60, 90, 120, 180, 240].map((seconds) => <button key={seconds} onClick={() => { setTimerLabel("Chrono de repos"); setTimerSeconds(seconds); setTimerRunning(true); }}>{seconds < 60 ? `${seconds}s` : seconds === 90 ? "1m30" : `${seconds / 60}m`}</button>)}</div></div><div className={`coach-card ${status.level}`}><span>RÉCUPÉRATION</span><strong>{status.label}</strong><p>{status.text}</p></div><button className="finish-link" onClick={finishSession}>Terminer maintenant</button></aside>
-        </div>
-      </div>}
-
-      {tab === "summary" && <div className="page summary-page">
-        <div className="page-title"><span>VUE D’ENSEMBLE</span><h1>Tous tes exercices, <em>sur un seul écran.</em></h1><p>{store.active ? "Le bilan se met à jour pendant ta séance. Tu peux revenir directement sur n’importe quel exercice." : lastCompletedSession ? "Voici le détail de ta dernière séance terminée." : "Commence une séance pour afficher toutes tes séries et répétitions."}</p></div>
-        {summaryRows.length ? <>
-          <section className="summary-totals">
-            <article><span>EXERCICES TERMINÉS</span><strong>{summaryDoneExercises}<em>/{summaryRows.length}</em></strong><small>{store.active ? "Séance en cours" : "Dernière séance"}</small></article>
-            <article><span>SÉRIES RÉALISÉES</span><strong>{summaryDoneSets}{summaryPlannedSets > 0 && <em>/{summaryPlannedSets}</em>}</strong><small>Validées série par série</small></article>
-            <article><span>RÉPÉTITIONS TOTALES</span><strong>{summaryTotalReps}</strong><small>Hors exercices chronométrés</small></article>
-          </section>
-          <section className="panel session-summary-panel">
-            <div className="panel-heading"><div><span>{store.active ? "SÉANCE EN DIRECT" : "DERNIÈRE SÉANCE TERMINÉE"}</span><h2>{store.active?.plan.title ?? lastCompletedSession?.title}</h2></div>{store.active && <button onClick={() => setTab("workout")}>Retour à la séance <Icon name="arrow" size={16} /></button>}</div>
-            <div className="summary-table">
-              <div className="summary-table-head"><span>EXERCICE</span><span>PRÉVU</span><span>FAIT</span><span>TOTAL</span><span>MEILLEURE</span><span>ÉTAT</span><span /></div>
-              {summaryRows.map((row) => {
-                const unitLabel = row.tracking === "seconds" ? "s" : "reps";
-                const performance = row.tracking === "check" ? (row.level ? `Niveau ${row.level}` : "Validation") : row.total === null ? "—" : `${row.total} ${unitLabel}`;
-                const best = row.tracking === "check" ? "—" : row.best === null ? "—" : `${row.best} ${unitLabel}`;
-                return <article className="summary-row" key={row.key}>
-                  <div className="summary-exercise"><strong>{row.name}</strong><small>{row.tracking === "seconds" ? "Temps" : row.tracking === "challenge" ? "Challenge 7 min" : row.tracking === "check" ? "Progression personnelle" : "Répétitions"}</small></div>
-                  <div className="summary-stat"><span>PRÉVU</span><strong>{row.plannedSets ?? "Libre"}</strong></div>
-                  <div className="summary-stat"><span>FAIT</span><strong>{row.completedSets}</strong></div>
-                  <div className="summary-stat"><span>TOTAL</span><strong>{performance}</strong></div>
-                  <div className="summary-stat"><span>MEILLEURE</span><strong>{best}</strong></div>
-                  <span className={`summary-status ${row.status}`}>{row.status === "done" ? "Terminé" : row.status === "active" ? "En cours" : "À faire"}</span>
-                  {store.active ? <button className="summary-open" onClick={() => openExerciseFromSummary(row.key)} aria-label={`Ouvrir ${row.name}`}><Icon name="arrow" size={16} /></button> : <span />}
-                </article>;
-              })}
-            </div>
-          </section>
-        </> : <section className="panel summary-empty"><span>00</span><div><strong>Aucune séance à résumer.</strong><p>Lance la séance du jour : les exercices apparaîtront ici automatiquement.</p><button className="primary-button" onClick={() => setTab("home")}>Voir la séance du jour <Icon name="arrow" /></button></div></section>}
-      </div>}
-
-      {tab === "progress" && <div className="page progress-page">
-        <div className="page-title"><span>PROGRESSION TOTALE</span><h1>Voir si tu progresses, <em>stagnes ou régresses.</em></h1><p>Chaque exercice au poids du corps est comparé d’une semaine à l’autre à partir de tes vraies séries.</p></div>
-        <section className="progress-summary"><article><span>SÉANCES PRINCIPALES</span><strong>{plannedMain}<em>/24</em></strong><small>4 séances × 6 semaines</small></article><article><span>ROUTINES FACULTATIVES</span><strong>{optionalCount}</strong><small>L-Sit, abdos ou souplesse</small></article><article><span>AVANCEMENT</span><strong>{complete ? 100 : Math.round(((absoluteDay - 1) / 42) * 100)}<em> %</em></strong><small>{complete ? "Bloc terminé" : `Semaine ${store.currentWeek} · Jour ${store.cycleDay}`}</small></article></section>
-
-        <section className="panel exercise-progress-panel">
-          <div className="progress-controls"><label><span>EXERCICE À ANALYSER</span><select value={progressExercise.id} onChange={(event) => setProgressExerciseId(event.target.value)}>{trackedExercises.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><div className="metric-switch">{(["best", "average", "total"] as const).map((metric) => <button key={metric} className={progressMetric === metric ? "active" : ""} onClick={() => setProgressMetric(metric)}>{metric === "best" ? "Meilleure série" : metric === "average" ? "Moyenne" : "Total séance"}</button>)}</div></div>
-          <div className="exercise-progress-summary"><div><span>PREMIÈRE MESURE</span><strong>{firstValue ?? "—"}<em>{firstValue !== null ? ` ${unit}` : ""}</em></strong></div><div><span>DERNIÈRE MESURE</span><strong>{lastValue ?? "—"}<em>{lastValue !== null ? ` ${unit}` : ""}</em></strong></div><div className={change === null ? "" : change > 0 ? "positive" : change < 0 ? "negative" : "neutral"}><span>ÉVOLUTION</span><strong>{change === null ? "—" : `${change > 0 ? "+" : ""}${change}`}<em>{change !== null ? ` ${unit}` : ""}</em></strong><small>{change === null ? "Pas assez de données" : change > 0 ? "Progression" : change < 0 ? "Régression" : "Stable"}</small></div></div>
-          <div className="exercise-bars">{progressByWeek.map((week) => { const value = week[progressMetric]; return <div className="exercise-bar-column" key={week.week}><div className="exercise-bar-value">{value ?? "—"}</div><div className="exercise-bar-track"><span className={week.week === store.currentWeek ? "current" : ""} style={{ height: `${value === null ? 2 : Math.max((value / chartMax) * 100, 5)}%` }} /></div><small>S{week.week}</small></div>; })}</div>
-          <div className="progress-legend"><span><i className="positive-dot" /> Hausse</span><span><i className="neutral-dot" /> Stable</span><span><i className="negative-dot" /> Baisse</span><p>Pour les exercices classiques, « meilleure série » correspond à ton meilleur nombre de répétitions ou secondes. Pour le Challenge 5×7, c’est le total des 7 minutes.</p></div>
-        </section>
-
-        <div className="progress-grid"><section className="panel chart-panel"><div className="panel-heading"><div><span>RÉGULARITÉ</span><h2>Séances principales par semaine</h2></div><small>OBJECTIF : 4</small></div><div className="bar-chart six-bars">{weeklyCounts.map((count, index) => <div className="bar-column" key={index}><div className="bar-track"><span className={index + 1 === store.currentWeek ? "current" : ""} style={{ height: `${Math.max(count ? (count / 4) * 100 : 4, 4)}%` }} />{count > 0 && <em>{count}</em>}</div><small>S{index + 1}</small></div>)}</div></section><section className="panel challenge-panel"><div className="panel-heading"><div><span>5×7</span><h2>Derniers totaux</h2></div></div><div className="challenge-history">{store.history.filter((record) => record.kind === "challenge").slice(-1).flatMap((record) => record.results.filter((result) => result.challengeTotal !== null)).map((item) => <div key={item.exerciseId}><span>{item.exerciseName}</span><strong>{item.challengeTotal}</strong></div>)}{!store.history.some((record) => record.kind === "challenge") && <p>Aucun challenge enregistré pour le moment.</p>}</div></section></div>
-        <section className="panel history-panel"><div className="panel-heading"><div><span>JOURNAL</span><h2>Dernières validations</h2></div></div>{store.history.length ? <div className="history-list">{[...store.history].reverse().slice(0, 20).map((record) => <article key={record.id} className={record.kind === "missed" ? "missed" : ""}><span className="history-check"><Icon name={record.kind === "rest" ? "moon" : record.kind === "missed" ? "skip" : "check"} size={18} /></span><div><strong>{record.title}</strong><small>{new Intl.DateTimeFormat("fr-FR", { day: "numeric", month: "long", year: "numeric" }).format(new Date(`${record.date}T12:00:00`))}</small></div><span>S{record.blockWeek} · J{record.cycleDay}</span><span>{record.kind === "missed" ? "Manquée" : record.kind === "rest" ? "Repos" : record.durationMin ? `${record.durationMin} min` : "—"}</span><span>{record.totalSteps ? `${record.completedSteps}/${record.totalSteps}` : "—"}</span></article>)}</div> : <div className="empty-state"><span>01</span><div><strong>Le journal est prêt.</strong><p>Ta première validation apparaîtra ici.</p></div></div>}</section>
-      </div>}
-
-      {tab === "skills" && <div className="page skills-page">
-        <div className="page-title"><span>NIVEAUX & SKILLS</span><h1>Niveau choisi, <em>performance mesurée.</em></h1><p>Les niveaux 1–3 identifient ta progression actuelle. Les scores personnels restent facultatifs.</p></div>
-        <section className="level-overview">{Object.entries(store.levels).map(([key, value]) => <article key={key}><span>{key.toUpperCase()}</span><strong>Niveau {value}</strong><div>{([1, 2, 3] as const).map((level) => <button key={level} className={value === level ? "active" : ""} onClick={() => setLevel(key as LevelKey, level)}>{level}</button>)}</div></article>)}</section>
-        <div className="skills-grid">{skillMetrics.map((skill, index) => {
-          const logs = store.skillLogs.filter((log) => log.skillId === skill.id);
-          const best = logs.length ? Math.max(...logs.map((log) => log.value)) : 0;
-          const progress = Math.min((best / skill.target) * 100, 100);
-          return <article className="skill-card" key={skill.id} style={{ "--skill-accent": skill.accent } as CSSProperties}><div className="skill-number">{String(index + 1).padStart(2, "0")}</div><span className="skill-label">MEILLEURE PERFORMANCE</span><h2>{skill.name}</h2><p>{best ? `${best} ${skill.unit}` : "Aucune performance enregistrée"}</p><div className="skill-progress"><span style={{ width: `${progress}%` }} /></div><div className="skill-target"><span>{Math.round(progress)} %</span><small>Cible : {skill.target} {skill.unit}</small></div><div className="skill-input"><input inputMode="decimal" aria-label={`Score ${skill.name}`} placeholder={`Score en ${skill.unit}`} value={skillInputs[skill.id] ?? ""} onChange={(event) => setSkillInputs({ ...skillInputs, [skill.id]: event.target.value })} /><button onClick={() => saveSkill(skill.id)}>AJOUTER</button></div></article>;
+      {!complete && <section className="card">
+        <div className="card-head"><h2>Cette semaine</h2><span>{weekMainDone} / 4 séances</span></div>
+        <div className="week">{DAY_LABELS.map((_, index) => {
+          const day = index + 1;
+          const record = [...weekRecords].reverse().find((item) => item.cycleDay === day && item.kind !== "optional") ?? weekRecords.find((item) => item.cycleDay === day);
+          const state = day < store.cycleDay ? record?.kind === "missed" ? "missed" : "done" : day === store.cycleDay ? "current" : REST_DAYS.has(day) ? "rest" : "planned";
+          return <button key={day} className={`week-day ${state}`} disabled={Boolean(active) && day > store.cycleDay} aria-label={`Jour ${day} : ${DAY_LABELS[index]}`} onClick={() => {
+            if (day > store.cycleDay && !active) setSheet({ type: "jump", day });
+            else { const plan = currentPlanForDay(day); if (plan) { setSelectedPlanId(plan.id); setTab("program"); } }
+          }}>
+            <span className="week-dot">{state === "done" ? <Icon name="check" size={16} stroke={2.6} /> : state === "missed" ? <Icon name="close" size={14} stroke={2.4} /> : `J${day}`}</span>
+            <small>{SHORT_DAY[index]}</small>
+          </button>;
         })}</div>
-      </div>}
+      </section>}
 
-      {tab === "more" && <div className="page more-page">
-        <div className="page-title"><span>RÉGLAGES</span><h1>Récupération et <em>sauvegarde.</em></h1><p>Toutes les données restent enregistrées localement sur cet appareil.</p></div>
-        <div className="more-grid"><section className="panel recovery-detail"><div className="panel-heading"><div><span>ÉTAT DU JOUR</span><h2>Ajuster la récupération</h2></div></div><div className={`big-status ${status.level}`}><span className="status-dot" /><div><strong>{status.label}</strong><p>{status.text}</p></div></div>{([['sleep', 'Sommeil', 4, 10, .5, ' h'], ['energy', 'Énergie', 1, 5, 1, ' / 5'], ['soreness', 'Courbatures', 1, 5, 1, ' / 5']] as const).map(([key, label, min, max, step, suffix]) => <label className="detail-slider" key={key}><div><span>{label}</span><strong>{store.recovery[key]}{suffix}</strong></div><input type="range" min={min} max={max} step={step} value={store.recovery[key]} onChange={(event) => setStore({ ...store, recovery: { ...store.recovery, [key]: Number(event.target.value) } })} /><small>Bas</small><small>Élevé</small></label>)}</section><section className="panel data-panel"><div className="panel-heading"><div><span>DONNÉES LOCALES</span><h2>Sauvegarder le suivi</h2></div></div><p>Exporte régulièrement une copie, surtout avant de changer d’iPhone ou de supprimer les données de Safari.</p><button className="data-action primary" onClick={exportData}><span className="data-icon"><Icon name="download" /></span><span><strong>Exporter la sauvegarde</strong><small>Fichier JSON complet</small></span><Icon name="arrow" size={17} /></button><button className="data-action" onClick={() => fileInputRef.current?.click()}><span className="data-icon"><Icon name="upload" /></span><span><strong>Restaurer une sauvegarde</strong><small>Ancienne (ChatGPT) ou nouvelle version</small></span><Icon name="arrow" size={17} /></button><div className="storage-info"><span><i /> Stockage local actif</span><span>{store.history.length} entrées</span></div></section></div>
-        <section className="install-banner"><div className="install-icon"><span /></div><div><span>INSTALLATION IPHONE</span><h2>Ajouter à l’écran d’accueil</h2><p>Dans Safari : Partager, puis « Sur l’écran d’accueil ».</p></div><div className="install-steps"><span><b>1</b> Ouvrir dans Safari</span><span><b>2</b> Partager → écran d’accueil</span></div></section>
-      </div>}
+      {previewRows.length > 0 && <section className="card">
+        <div className="card-head"><h2>Dernière fois{previewDate ? ` · ${formatShortDate(previewDate)}` : ""}</h2><span>à battre</span></div>
+        <div className="rows">{previewRows.map(({ item, previous: prev }) => <div className="row" key={item.id}><span>{item.name.replace("Progression ", "")}</span><strong>{prev ? previousLine(prev) : "—"}</strong></div>)}</div>
+      </section>}
 
-      <input ref={fileInputRef} type="file" accept="application/json,.json" hidden onChange={importData} />
-      {sheet && <div className="sheet-backdrop" onClick={() => setSheet(null)}>
-        <section className="sheet" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
-          {sheet.type === "skip" && currentPlan && <>
-            <span className="sheet-eyebrow">S{store.currentWeek} · JOUR {store.cycleDay}</span>
-            <h2>Pas de salle aujourd’hui ?</h2>
-            <p>Deux options, aucune ne crée de fausse séance dans ton historique.</p>
-            <button className="sheet-option" onClick={() => setSheet(null)}><strong>La garder pour plus tard</strong><small>Rien ne bouge : {currentPlan.title} reste ta prochaine séance, demain ou quand tu peux.</small></button>
-            <button className="sheet-option" onClick={markMissed}><strong>La marquer comme manquée</strong><small>Le planning passe au jour suivant ({DAY_LABELS[store.cycleDay % 7]}). Elle n’entre pas dans tes stats ni dans tes perfs.</small></button>
-            <button className="sheet-cancel" onClick={() => setSheet(null)}>Annuler</button>
-          </>}
-          {sheet.type === "jump" && jumpTarget && <>
-            <span className="sheet-eyebrow">S{store.currentWeek} · JOUR {jumpTarget}</span>
-            <h2>Aller directement à {DAY_LABELS[jumpTarget - 1]} ?</h2>
-            <p>Les jours entre deux seront notés automatiquement :</p>
-            <ul className="sheet-list">{jumpSkipped.map((day) => { const plan = currentPlanForDay(day); return <li key={day}><span>J{day}</span><strong>{plan ? plan.title : "Jour libre"}</strong><em className={plan ? "missed" : ""}>{plan ? "Manquée" : "Repos"}</em></li>; })}</ul>
-            <button className="primary-button" onClick={() => jumpToDay(jumpTarget)}><span>Confirmer</span><Icon name="arrow" /></button>
-            {currentPlanForDay(jumpTarget) && <button className="sheet-cancel" onClick={() => { const plan = currentPlanForDay(jumpTarget); if (plan) { setSelectedPlanId(plan.id); setTab("program"); } setSheet(null); }}>Juste voir la séance</button>}
-            <button className="sheet-cancel" onClick={() => setSheet(null)}>Annuler</button>
-          </>}
-        </section>
-      </div>}
+      {isRestDay && !active && <section className="card">
+        <div className="card-head"><h2>Routines facultatives</h2></div>
+        <div className="rows">
+          <button className="row row-button" onClick={() => startPlan(lSitPlan, true)}><span><strong>L-Sit intensif</strong><small>≈ {lSitPlan.duration} min · compression</small></span><Icon name="chevron" size={18} /></button>
+          <button className="row row-button" onClick={() => setTab("program")}><span><strong>Abdos</strong><small>4 circuits réglables</small></span><Icon name="chevron" size={18} /></button>
+          <button className="row row-button" onClick={() => setTab("program")}><span><strong>Souplesse</strong><small>3 routines, 30 à 60 s</small></span><Icon name="chevron" size={18} /></button>
+        </div>
+      </section>}
 
-      <nav className="bottom-nav" aria-label="Navigation mobile">{navItems.map((item) => <button key={item.id} className={tab === item.id ? "active" : ""} onClick={() => setTab(item.id)}><Icon name={item.icon} size={19} /><span>{item.label}</span></button>)}</nav>
+      <div className="block-progress"><div className="bar"><span style={{ width: `${((absoluteDay - (complete ? 0 : 1)) / 42) * 100}%` }} /></div><span>Bloc 1 · J{absoluteDay} / 42 · {mainDone} séances{missedCount ? ` · ${missedCount} manquée${missedCount > 1 ? "s" : ""}` : ""}</span></div>
+    </div>;
+  };
+
+  const renderProgram = () => <div className="page">
+    {header("Programme", "Bloc 1 · 6 semaines")}
+    <div className="segmented scroll">{mainPlans.map((plan) => <button key={plan.id} className={selectedPlan.id === plan.id ? "active" : ""} onClick={() => setSelectedPlanId(plan.id)}>J{plan.scheduleDay} · {plan.shortTitle}</button>)}</div>
+    <section className="card">
+      <div className="plan-head"><div><h2>{selectedPlan.title}</h2><p>{selectedPlan.focus}</p></div><span className="pill"><Icon name="clock" size={15} />{selectedPlan.duration} min</span></div>
+      <button className="btn btn-primary" onClick={() => startPlan(selectedPlan, currentPlan?.id === selectedPlan.id)}><Icon name="play" size={16} />{currentPlan?.id === selectedPlan.id ? "Lancer la séance du jour" : "Faire hors planning"}</button>
     </section>
+    {selectedPlan.blocks.map((block) => <section className="card" key={block.id}>
+      <div className="card-head"><h2>{block.label}</h2><span>{block.kind === "superset" ? "Superset · " : block.kind === "circuit" ? "Circuit · " : ""}{block.roundsLabel}</span></div>
+      <div className="rows">{block.exercises.map((item) => {
+        const prev = item.tracking !== "check" ? lastPerformance(store.history, item.id) : null;
+        return <div className="row exercise-row" key={item.id}>
+          <span><strong>{item.name}</strong><small>{item.target}{item.restLabel !== "—" ? ` · repos ${item.restLabel}` : ""}</small></span>
+          {prev && <em>{previousLine(prev)}</em>}
+        </div>;
+      })}</div>
+    </section>)}
+
+    <h2 className="section-title">Routines facultatives</h2>
+    <section className="card">
+      <div className="plan-head"><div><h2>L-Sit intensif</h2><p>Technique en supersets puis circuit de compression.</p></div><span className="pill">{lSitPlan.duration} min</span></div>
+      <button className="btn btn-secondary" onClick={() => startPlan(lSitPlan, isRestDay)}>Lancer</button>
+    </section>
+    <section className="card">
+      <div className="plan-head"><div><h2>Abdos</h2><p>{absRoutines[absKey].exercises.length} exercices · {absPlan.duration} min</p></div></div>
+      <div className="field-grid">
+        <label>Routine<select value={absKey} onChange={(event) => setAbsKey(event.target.value as AbsRoutineKey)}>{Object.entries(absRoutines).map(([key, routine]) => <option key={key} value={key}>{routine.name}</option>)}</select></label>
+        <label>Effort<select value={absEffort} onChange={(event) => setAbsEffort(Number(event.target.value))}><option value={30}>30 s</option><option value={45}>45 s</option></select></label>
+        <label>Transition<select value={absTransition} onChange={(event) => setAbsTransition(Number(event.target.value))}><option value={15}>15 s</option><option value={30}>30 s</option></select></label>
+        <label>Tours<select value={absRounds} onChange={(event) => setAbsRounds(Number(event.target.value))}>{[2, 3, 4, 5].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+      </div>
+      <button className="btn btn-secondary" onClick={() => startPlan(absPlan, isRestDay)}>Lancer le circuit</button>
+    </section>
+    <section className="card">
+      <div className="plan-head"><div><h2>Souplesse</h2><p>{flexibilityRoutines[flexKey].exercises.length} positions · {flexPlan.duration} min</p></div></div>
+      <div className="field-grid">
+        <label>Routine<select value={flexKey} onChange={(event) => setFlexKey(event.target.value as FlexRoutineKey)}>{Object.entries(flexibilityRoutines).map(([key, routine]) => <option key={key} value={key}>{routine.name}</option>)}</select></label>
+        <label>Séries<select value={flexSets} onChange={(event) => setFlexSets(Number(event.target.value))}>{[3, 4, 5, 6].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+        <label>Maintien<select value={flexHold} onChange={(event) => setFlexHold(Number(event.target.value))}>{[30, 45, 60].map((value) => <option key={value} value={value}>{value} s</option>)}</select></label>
+        <label>Repos<select value={flexRest} onChange={(event) => setFlexRest(Number(event.target.value))}>{[20, 40, 60].map((value) => <option key={value} value={value}>{value} s</option>)}</select></label>
+      </div>
+      <button className="btn btn-secondary" onClick={() => startPlan(flexPlan, isRestDay)}>Lancer la routine</button>
+    </section>
+  </div>;
+
+  const renderSummary = () => {
+    const rows = active ? activeSummary(groups, store.levels) : lastSession ? completedSummary(lastSession) : [];
+    const doneSets = rows.reduce((sum, row) => sum + row.completedSets, 0);
+    const plannedSets = rows.reduce((sum, row) => sum + (row.plannedSets ?? 0), 0);
+    const totalReps = rows.filter((row) => row.tracking === "reps" || row.tracking === "challenge").reduce((sum, row) => sum + (row.total ?? 0), 0);
+    const exercise = trackedExercises.find((item) => item.id === progressExerciseId) ?? trackedExercises[0];
+    const weeks = Array.from({ length: 6 }, (_, index) => {
+      const values = store.history.filter((record) => record.blockWeek === index + 1).flatMap((record) => record.results)
+        .filter((result) => result.exerciseId === exercise.id)
+        .map((result) => result.challengeTotal ?? result.value)
+        .filter((value): value is number => value !== null && value > 0);
+      if (!values.length) return { week: index + 1, best: null, average: null, total: null } as Record<ProgressMetric, number | null> & { week: number };
+      return { week: index + 1, best: Math.max(...values), average: Math.round((values.reduce((a, b) => a + b, 0) / values.length) * 10) / 10, total: values.reduce((a, b) => a + b, 0) };
+    });
+    const plotted = weeks.map((week) => week[progressMetric]);
+    const numbers = plotted.filter((value): value is number => value !== null);
+    const max = Math.max(...numbers, 1);
+    const change = numbers.length > 1 ? Math.round((numbers[numbers.length - 1] - numbers[0]) * 10) / 10 : null;
+    const unit = exercise.tracking === "seconds" ? "s" : "reps";
+
+    return <div className="page">
+      {header("Bilan")}
+      <div className="segmented">
+        <button className={summaryView === "session" ? "active" : ""} onClick={() => setSummaryView("session")}>Séance</button>
+        <button className={summaryView === "progress" ? "active" : ""} onClick={() => setSummaryView("progress")}>Progrès</button>
+        <button className={summaryView === "journal" ? "active" : ""} onClick={() => setSummaryView("journal")}>Journal</button>
+      </div>
+
+      {summaryView === "session" && (rows.length ? <>
+        <section className="card">
+          <div className="card-head"><h2>{active ? active.plan.title : lastSession?.title}</h2><span>{active ? "En cours" : lastSession ? `${formatShortDate(lastSession.date)}${lastSession.durationMin ? ` · ${lastSession.durationMin} min` : ""}` : ""}</span></div>
+          <div className="stats">
+            <div><strong>{rows.filter((row) => row.status === "done").length}<em>/{rows.length}</em></strong><span>Exercices</span></div>
+            <div><strong>{doneSets}{plannedSets > 0 && <em>/{plannedSets}</em>}</strong><span>Séries</span></div>
+            <div><strong>{totalReps}</strong><span>Reps</span></div>
+          </div>
+        </section>
+        <section className="card">
+          <div className="rows">{rows.map((row) => {
+            const index = groups.findIndex((item) => item.key === row.key);
+            const value = row.tracking === "check" ? (row.level ? `Niv. ${row.level}` : "—") : row.total === null ? "—" : `${row.total} ${unitFor(row.tracking)}`;
+            const content = <>
+              <span className={`status-dot ${row.status}`} />
+              <span className="grow"><strong>{row.name}</strong><small>{row.plannedSets ? `${row.completedSets}/${row.plannedSets} séries` : `${row.completedSets} séries`}{row.best !== null && row.tracking !== "check" ? ` · max ${row.best} ${unitFor(row.tracking)}` : ""}</small></span>
+              <em>{value}</em>
+            </>;
+            return active && index >= 0
+              ? <button className="row row-button summary-row" key={row.key} onClick={() => { goToGroup(index); setTab("workout"); }}>{content}</button>
+              : <div className="row summary-row" key={row.key}>{content}</div>;
+          })}</div>
+        </section>
+        {active && <button className="btn btn-secondary" onClick={() => setTab("workout")}>Retour à la séance</button>}
+      </> : <div className="empty"><strong>Rien à résumer pour l’instant.</strong><p>Ta prochaine séance apparaîtra ici.</p></div>)}
+
+      {summaryView === "progress" && <>
+        <section className="card">
+          <label className="select-field"><span>Exercice</span><select value={exercise.id} onChange={(event) => setProgressExerciseId(event.target.value)}>{trackedExercises.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+          <div className="segmented small">{(["best", "average", "total"] as const).map((metric) => <button key={metric} className={progressMetric === metric ? "active" : ""} onClick={() => setProgressMetric(metric)}>{metric === "best" ? "Meilleure" : metric === "average" ? "Moyenne" : "Total"}</button>)}</div>
+          <div className="chart">{weeks.map((week) => { const value = week[progressMetric]; return <div className="chart-col" key={week.week}><em>{value ?? ""}</em><div className="chart-track"><span className={week.week === store.currentWeek ? "current" : ""} style={{ height: `${value === null ? 0 : Math.max((value / max) * 100, 6)}%` }} /></div><small>S{week.week}</small></div>; })}</div>
+          <div className="stats">
+            <div><strong>{numbers[0] ?? "—"}</strong><span>Première ({unit})</span></div>
+            <div><strong>{numbers.at(-1) ?? "—"}</strong><span>Dernière ({unit})</span></div>
+            <div className={change === null ? "" : change > 0 ? "up" : change < 0 ? "down" : ""}><strong>{change === null ? "—" : `${change > 0 ? "+" : ""}${change}`}</strong><span>Évolution</span></div>
+          </div>
+        </section>
+        <section className="card">
+          <div className="card-head"><h2>Régularité</h2><span>objectif 4 / semaine</span></div>
+          <div className="regularity">{Array.from({ length: 6 }, (_, index) => {
+            const records = store.history.filter((record) => record.blockWeek === index + 1);
+            const done = records.filter((record) => record.kind === "main" || record.kind === "challenge").length;
+            const missed = records.filter((record) => record.kind === "missed").length;
+            return <div key={index} className="regularity-row"><small>S{index + 1}</small><div className="pips">{Array.from({ length: 4 }, (_, pip) => <i key={pip} className={pip < done ? "done" : pip < done + missed ? "missed" : ""} />)}</div><span>{done}{missed ? ` · ${missed} manquée${missed > 1 ? "s" : ""}` : ""}</span></div>;
+          })}</div>
+        </section>
+      </>}
+
+      {summaryView === "journal" && <section className="card">
+        {store.history.length ? <div className="rows">{[...store.history].reverse().slice(0, 40).map((record) => <div className={`row journal-row ${record.kind}`} key={record.id}>
+          <span className="journal-icon"><Icon name={record.kind === "rest" ? "moon" : record.kind === "missed" ? "skip" : "check"} size={16} stroke={2.2} /></span>
+          <span className="grow"><strong>{record.title}</strong><small>{formatShortDate(record.date)} · S{record.blockWeek} J{record.cycleDay}</small></span>
+          <em>{record.kind === "missed" ? "Manquée" : record.kind === "rest" ? "Repos" : record.durationMin ? `${record.durationMin} min` : `${record.completedSteps}/${record.totalSteps}`}</em>
+        </div>)}</div> : <div className="empty"><strong>Journal vide.</strong></div>}
+      </section>}
+    </div>;
+  };
+
+  const renderSkills = () => <div className="page">
+    {header("Niveaux")}
+    <section className="card">
+      <div className="card-head"><h2>Progressions</h2><span>niveau actuel</span></div>
+      <div className="rows">{(Object.keys(store.levels) as LevelKey[]).map((key) => <div className="row level-row" key={key}>
+        <strong>{LEVEL_LABELS[key]}</strong>
+        <div className="segmented tiny">{([1, 2, 3] as const).map((level) => <button key={level} aria-label={`${LEVEL_LABELS[key]} niveau ${level}`} className={store.levels[key] === level ? "active" : ""} onClick={() => setLevel(key, level)}>{level}</button>)}</div>
+      </div>)}</div>
+    </section>
+    <h2 className="section-title">Skills</h2>
+    {skillMetrics.map((skill) => {
+      const logs = store.skillLogs.filter((log) => log.skillId === skill.id);
+      const fromHistory = personalBest(store.history, skill.id);
+      const bestValue = Math.max(0, ...logs.map((log) => log.value), fromHistory?.value ?? 0);
+      const progress = Math.min((bestValue / skill.target) * 100, 100);
+      return <section className="card skill" key={skill.id}>
+        <div className="card-head"><h2>{skill.name}</h2><span>objectif {skill.target} {skill.unit}</span></div>
+        <div className="skill-value"><strong>{bestValue || "—"}</strong>{bestValue > 0 && <em>{skill.unit}</em>}<span>{Math.round(progress)} %</span></div>
+        <div className="bar"><span style={{ width: `${progress}%` }} /></div>
+        <div className="inline-input"><input inputMode="decimal" aria-label={`Nouveau score ${skill.name}`} placeholder={`Nouveau score (${skill.unit})`} value={skillInputs[skill.id] ?? ""} onChange={(event) => setSkillInputs({ ...skillInputs, [skill.id]: event.target.value })} /><button className="btn btn-secondary btn-small" onClick={() => saveSkill(skill.id)}>Ajouter</button></div>
+      </section>;
+    })}
+  </div>;
+
+  const renderSettings = () => <div className="page">
+    {header("Réglages", undefined, () => setTab("home"))}
+    <section className="card">
+      <div className="card-head"><h2>Sauvegarde</h2><span>{store.history.length} entrées</span></div>
+      <p className="muted">Tes données restent sur cet iPhone. Exporte une copie de temps en temps.</p>
+      <div className="rows">
+        <button className="row row-button" onClick={exportData}><span className="row-icon"><Icon name="download" size={18} /></span><span className="grow"><strong>Exporter la sauvegarde</strong><small>Fichier .json</small></span><Icon name="chevron" size={18} /></button>
+        <button className="row row-button" onClick={() => fileInputRef.current?.click()}><span className="row-icon"><Icon name="upload" size={18} /></span><span className="grow"><strong>Restaurer une sauvegarde</strong><small>Ancienne ou nouvelle version</small></span><Icon name="chevron" size={18} /></button>
+      </div>
+    </section>
+    <section className="card">
+      <div className="card-head"><h2>Récupération</h2><span className={`recovery ${status.level}`}>{status.label}</span></div>
+      <p className="muted">{status.text}</p>
+      {([["sleep", "Sommeil", 4, 10, 0.5, " h"], ["energy", "Énergie", 1, 5, 1, " / 5"], ["soreness", "Courbatures", 1, 5, 1, " / 5"]] as const).map(([key, label, min, max, stepValue, suffix]) => <label className="slider" key={key}>
+        <span><span>{label}</span><strong>{store.recovery[key]}{suffix}</strong></span>
+        <input type="range" min={min} max={max} step={stepValue} value={store.recovery[key]} onChange={(event) => setStore({ ...store, recovery: { ...store.recovery, [key]: Number(event.target.value) } })} />
+      </label>)}
+    </section>
+    <section className="card">
+      <div className="card-head"><h2>Installer sur l’iPhone</h2></div>
+      <p className="muted">Dans Safari : Partager, puis « Sur l’écran d’accueil ».</p>
+    </section>
+  </div>;
+
+  /* ---------- Séance (plein écran) ---------- */
+  const renderWorkout = () => {
+    if (!active || !group || !step) return <div className="page">
+      {header("Séance")}
+      <div className="empty"><strong>Aucune séance en cours.</strong><p>Lance la séance du jour depuis l’accueil.</p><button className="btn btn-primary" onClick={() => setTab("home")}>Voir la séance du jour</button></div>
+    </div>;
+    const isChallenge = step.tracking === "challenge";
+    const isCheck = step.tracking === "check";
+    const showBallast = step.loadMode === "weighted" || step.loadMode === "band_or_weight";
+    const showVariant = step.loadMode !== "none" && !isChallenge;
+    const allDone = groupDone(group);
+    const isLast = groupIndex === groups.length - 1;
+    const minutes = Math.round((active.activeMs ?? 0) / 60000);
+    const blockKind = step.blockKind === "superset" ? "Superset" : step.blockKind === "circuit" ? "Circuit" : step.blockKind === "challenge" ? "Challenge" : step.blockLabel;
+    const previousVariant = previous?.results.map((result) => result.variant.trim()).find(Boolean) ?? "";
+    const timerVisible = timerRunning || timerSeconds > 0;
+    const nextGroup = groups[groupIndex + 1];
+
+    return <div className="workout">
+      <div className="workout-top">
+        <button className="icon-button plain" aria-label="Quitter la séance" onClick={() => setSheet({ type: "exit" })}><Icon name="close" /></button>
+        <div className="workout-title">{active.plan.title}{minutes > 0 && <span> · {minutes} min</span>}</div>
+        <button className="icon-button plain" aria-label="Liste des exercices" onClick={() => setSheet({ type: "exercises" })}><Icon name="list" /></button>
+      </div>
+      <div className="segments">{groups.map((item, index) => <button key={item.key} aria-label={`Exercice ${index + 1}`} className={groupDone(item) ? "done" : index === groupIndex ? "current" : ""} onClick={() => goToGroup(index)} />)}</div>
+
+      <div className="workout-body">
+        {groupIndex === 0 && <button className={`warmup ${active.warmupDone ? "done" : ""}`} onClick={() => setStore({ ...store, active: { ...active, warmupDone: !active.warmupDone } })}>
+          <span className="check-circle small"><Icon name="check" size={14} stroke={2.6} /></span>Échauffement {active.warmupDone ? "fait" : "à faire"}
+        </button>}
+        <p className="eyebrow">{blockKind} · exercice {groupIndex + 1} / {groups.length}</p>
+        <h1 className="exercise-title">{step.name}</h1>
+        <div className="chips">
+          <span className="chip strong">{isChallenge ? "Max en 7 min" : /^(\d|MR|≈)/.test(step.target) ? `Objectif ${step.target}` : step.target}</span>
+          <span className="chip">{step.tempo}</span>
+          {step.restSec > 0 && !isChallenge && <span className="chip">Repos {step.restLabel}</span>}
+        </div>
+
+        {step.levelKey && <div className="level-line"><span>Niveau</span><div className="segmented tiny">{([1, 2, 3] as const).map((level) => <button key={level} className={store.levels[step.levelKey!] === level ? "active" : ""} onClick={() => setLevel(step.levelKey!, level)}>{level}</button>)}</div></div>}
+
+        {!isCheck && <div className={`last-time ${previous ? "" : "empty"}`}>
+          <div><small>{previous ? `Dernière fois · ${formatShortDate(previous.record.date)}` : "Dernière fois"}</small><strong>{previous ? previousLine(previous) : "Première fois"}</strong>{previous && previousDetails(previous) && <span>{previousDetails(previous)}</span>}</div>
+          {best && <div className="record"><small>Record</small><strong>{best.value}</strong></div>}
+        </div>}
+
+        {isChallenge ? <section className="card challenge">
+          <div className="challenge-total"><div><small>Total</small><strong>{step.result.miniSets.reduce((sum, value) => sum + (Number(value) || 0), 0)}</strong></div><button className="btn btn-secondary btn-small" onClick={() => startRest(420, "Bloc 7 min")}><Icon name="clock" size={16} />Lancer 7 min</button></div>
+          <div className="mini-sets">{step.result.miniSets.map((value, setIndex) => <label key={setIndex}><span>{setIndex + 1}</span><input inputMode="numeric" value={value} placeholder="0" onChange={(event) => updateMiniSet(group.firstIndex, setIndex, event.target.value)} /></label>)}<button className="mini-add" aria-label="Ajouter une série" onClick={() => addMiniSet(group.firstIndex)}><Icon name="plus" size={18} /></button></div>
+        </section> : isCheck ? <section className="card">
+          <p className="muted">Routine gérée de ton côté : choisis ton niveau, note la variante si besoin, puis valide.</p>
+        </section> : <section className="card sets">
+          <div className={`set-grid head ${showBallast ? "with-ballast" : ""}`}><span>Série</span><span>{step.tracking === "seconds" ? "Secondes" : "Reps"}</span>{showBallast && <span>Lest (kg)</span>}<span /></div>
+          {group.entries.map(({ index, step: item }) => {
+            const prevSet = previous?.results.find((result) => result.series === item.round && result.value !== null) ?? null;
+            const current = item.result.value === "" ? null : Number(item.result.value);
+            const delta = prevSet?.value != null && current !== null && Number.isFinite(current) ? Math.round((current - prevSet.value) * 10) / 10 : null;
+            const firstOpen = group.entries.find(({ step: entry }) => !entry.result.done)?.index === index;
+            return <div key={item.stepId} className={`set-grid ${showBallast ? "with-ballast" : ""} ${item.result.done ? "done" : ""} ${firstOpen ? "current" : ""}`}>
+              <span className="set-number">{item.round}</span>
+              {item.result.done ? <span className="set-value"><strong>{item.result.value || "—"}</strong><Delta value={delta} /></span>
+                : <label className="set-input"><span className="sr-only">{item.name} série {item.round}</span><input inputMode="decimal" value={item.result.value} placeholder={prevSet?.value != null ? String(prevSet.value) : item.target.match(/\d+/)?.[0] ?? "0"} onChange={(event) => updateResult(index, "value", event.target.value)} /></label>}
+              {showBallast && (item.result.done ? <span className="set-muted">{item.result.ballast ? `+${item.result.ballast}` : "—"}</span>
+                : <label className="set-input light"><span className="sr-only">Lest série {item.round}</span><input inputMode="decimal" value={item.result.ballast} placeholder={prevSet?.ballast ? String(prevSet.ballast) : "0"} onChange={(event) => updateResult(index, "ballast", event.target.value)} /></label>)}
+              <button className={`check-circle ${item.result.done ? "on" : ""}`} aria-label={`${item.result.done ? "Réouvrir" : "Valider"} la série ${item.round}`} onClick={() => toggleSet(index)}><Icon name="check" size={18} stroke={2.6} /></button>
+            </div>;
+          })}
+        </section>}
+
+        {(showVariant || isCheck) && <label className="variant-field">
+          <span>Variante</span>
+          <input value={step.result.variant} placeholder={previousVariant || "Aucune assistance"} onChange={(event) => setGroupVariant(event.target.value)} />
+        </label>}
+
+        {(isCheck || isChallenge) && <button className={`btn ${allDone ? "btn-secondary" : "btn-primary"}`} onClick={toggleGroup}><Icon name="check" size={18} stroke={2.4} />{allDone ? "Validé" : "Valider l’exercice"}</button>}
+        {!isCheck && !isChallenge && !allDone && <button className="btn btn-text" onClick={toggleGroup}>Tout valider d’un coup</button>}
+
+        {(step.easier || step.harder || step.note) && <div className="tips">
+          <button className="tips-toggle" onClick={() => setTipsOpen(!tipsOpen)}>Conseils <Icon name="chevron" size={16} /></button>
+          {tipsOpen && <div className="tips-body">
+            {step.note && <p>{step.note}</p>}
+            {step.easier && <p><strong>Plus simple :</strong> {step.easier}</p>}
+            {step.harder && <p><strong>Plus dur :</strong> {step.harder}</p>}
+          </div>}
+        </div>}
+      </div>
+
+      <div className="workout-bar">
+        {timerVisible ? <div className="rest-bar">
+          <div className="grow"><small>{timerLabel}{nextGroup && timerLabel === "Repos" && allDone ? ` · puis ${nextGroup.entries[0].step.name.replace("Progression ", "")}` : ""}</small><strong>{formatTimer(timerSeconds)}</strong></div>
+          <button className="rest-ghost" onClick={() => { setTimerSeconds(timerSeconds + 15); setTimerRunning(true); }}>+15</button>
+          <button className="rest-main" onClick={resetTimer}>Passer</button>
+        </div> : <div className="nav-bar">
+          <button className="icon-button" aria-label="Exercice précédent" disabled={groupIndex === 0} onClick={() => goToGroup(groupIndex - 1)}><Icon name="back" /></button>
+          {isLast ? <button className="btn btn-primary grow" onClick={finishSession}><Icon name="check" size={18} stroke={2.4} />Terminer la séance</button>
+            : <button className={`btn grow ${allDone ? "btn-primary" : "btn-secondary"}`} onClick={() => goToGroup(groupIndex + 1)}>Exercice suivant<Icon name="arrow" size={18} /></button>}
+        </div>}
+      </div>
+    </div>;
+  };
+
+  const navItems: { id: Tab; label: string; icon: IconName }[] = [
+    { id: "home", label: "Aujourd’hui", icon: "home" },
+    { id: "program", label: "Programme", icon: "program" },
+    { id: "summary", label: "Bilan", icon: "chart" },
+    { id: "skills", label: "Niveaux", icon: "levels" },
+  ];
+  const inWorkout = tab === "workout" && Boolean(active);
+
+  return <main className={`app ${inWorkout ? "in-workout" : ""}`}>
+    {tab === "home" && renderHome()}
+    {tab === "program" && renderProgram()}
+    {tab === "summary" && renderSummary()}
+    {tab === "skills" && renderSkills()}
+    {tab === "settings" && renderSettings()}
+    {tab === "workout" && renderWorkout()}
+
+    {!inWorkout && active && tab !== "home" && <button className="resume-pill" onClick={() => setTab("workout")}><span className="pulse" />{active.plan.shortTitle} en cours<Icon name="chevron" size={16} /></button>}
+
+    {!inWorkout && <nav className="tabbar" aria-label="Navigation">{navItems.map((item) => <button key={item.id} className={tab === item.id ? "active" : ""} onClick={() => { setTab(item.id); window.scrollTo({ top: 0 }); }}><Icon name={item.icon} /><span>{item.label}</span></button>)}</nav>}
+
+    <input ref={fileInputRef} type="file" accept="application/json,.json" hidden onChange={importData} />
+
+    {sheet && <div className="sheet-backdrop" onClick={() => setSheet(null)}>
+      <section className="sheet" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+        <span className="sheet-grabber" />
+        {sheet.type === "skip" && currentPlan && <>
+          <h2>Pas de salle aujourd’hui ?</h2>
+          <p>Aucune des deux options ne crée de fausse séance.</p>
+          <button className="sheet-option" onClick={() => setSheet(null)}><strong>La garder pour plus tard</strong><small>{currentPlan.title} reste ta prochaine séance.</small></button>
+          <button className="sheet-option" onClick={markMissed}><strong>La marquer comme manquée</strong><small>Le planning passe au jour {store.cycleDay % 7 + 1}. Hors stats et hors perfs.</small></button>
+          <button className="btn btn-text" onClick={() => setSheet(null)}>Annuler</button>
+        </>}
+        {sheet.type === "jump" && jumpTarget && <>
+          <h2>Aller à {DAY_LABELS[jumpTarget - 1].replace(" / séance supp.", "")} ?</h2>
+          <p>Les jours entre deux seront notés automatiquement.</p>
+          <div className="rows boxed">{jumpSkipped.map((day) => { const plan = currentPlanForDay(day); return <div className="row" key={day}><span>J{day} · {plan ? plan.title : "Jour libre"}</span><em className={plan ? "missed" : ""}>{plan ? "Manquée" : "Repos"}</em></div>; })}</div>
+          <button className="btn btn-primary btn-large" onClick={() => jumpToDay(jumpTarget)}>Confirmer</button>
+          {currentPlanForDay(jumpTarget) && <button className="btn btn-text" onClick={() => { const plan = currentPlanForDay(jumpTarget); if (plan) { setSelectedPlanId(plan.id); setTab("program"); } setSheet(null); }}>Juste voir la séance</button>}
+        </>}
+        {sheet.type === "exit" && active && <>
+          <h2>Quitter la séance ?</h2>
+          <button className="sheet-option" onClick={finishSession}><strong>Terminer et enregistrer</strong><small>{active.steps.filter((item) => item.result.done).length} séries validées sur {active.steps.length}.</small></button>
+          <button className="sheet-option" onClick={() => { setSheet(null); setTab("home"); }}><strong>Mettre en pause</strong><small>Tu la reprends depuis l’accueil quand tu veux.</small></button>
+          <button className="sheet-option danger" onClick={abandonSession}><strong>Abandonner</strong><small>Rien n’est enregistré.</small></button>
+        </>}
+        {sheet.type === "exercises" && active && <>
+          <h2>{active.plan.title}</h2>
+          <div className="rows boxed">{groups.map((item, index) => {
+            const doneCount = item.entries.filter(({ step: entry }) => entry.result.done).length;
+            return <button key={item.key} className={`row row-button ${index === groupIndex ? "current" : ""}`} onClick={() => goToGroup(index)}>
+              <span className={`status-dot ${groupDone(item) ? "done" : doneCount ? "active" : "todo"}`} />
+              <span className="grow"><strong>{item.entries[0].step.name}</strong><small>{doneCount}/{item.entries.length} séries</small></span>
+              <Icon name="chevron" size={16} />
+            </button>;
+          })}</div>
+        </>}
+      </section>
+    </div>}
   </main>;
 }
-

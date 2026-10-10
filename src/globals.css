@@ -372,3 +372,4 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .side-tag { position: absolute; top: 4px; left: 7px; color: var(--faint); font-size: 10px; font-weight: 800; pointer-events: none; }
 .set-grid.current .set-input.side input { border: 2px solid var(--accent); background: var(--card); }
 .set-grid.with-ballast:has(.side-inputs) { grid-template-columns: 34px minmax(0, 1.7fr) minmax(0, 1fr) 44px; }
+.set-input.light.side input { font-size: 16px; }

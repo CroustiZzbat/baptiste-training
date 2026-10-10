@@ -841,8 +841,8 @@ export default function App() {
               <label className="set-input side"><span className="side-tag">D</span><span className="sr-only">{item.name} série {item.round} côté droit</span><input inputMode="decimal" value={item.result.right ?? ""} placeholder={String(prevSet?.sides?.right ?? prevSet?.value ?? item.target.match(/\d+/)?.[0] ?? "0")} onChange={(event) => updateSide(index, "right", event.target.value)} /></label>
             </span>
             : <label className="set-input"><span className="sr-only">{item.name} série {item.round}</span><input inputMode="decimal" value={item.result.value} placeholder={prevSet?.value != null ? String(prevSet.value) : item.target.match(/\d+/)?.[0] ?? "0"} onChange={(event) => updateResult(index, "value", event.target.value)} /></label>}
-          {showBallast && (!hasBallast ? <span /> : item.result.done ? <span className="set-muted">{item.result.ballast ? `+${item.result.ballast}` : "—"}</span>
-            : <label className="set-input light"><span className="sr-only">Lest {item.name} série {item.round}</span><input inputMode="decimal" value={item.result.ballast} placeholder={prevSet?.ballast ? String(prevSet.ballast) : "0"} onChange={(event) => updateResult(index, "ballast", event.target.value)} /></label>)}
+          {showBallast && (!hasBallast ? <span /> : item.result.done ? <span className="set-muted">{item.result.ballast ? `+${item.result.ballast} kg` : ""}</span>
+            : <label className="set-input light side"><span className="side-tag">kg</span><span className="sr-only">Lest {item.name} série {item.round}</span><input inputMode="decimal" value={item.result.ballast} placeholder={prevSet?.ballast ? String(prevSet.ballast) : "0"} onChange={(event) => updateResult(index, "ballast", event.target.value)} /></label>)}
           <button className={`check-circle ${item.result.done ? "on" : ""}`} aria-label={`${item.result.done ? "Réouvrir" : "Valider"} ${item.name} série ${item.round}`} onClick={() => toggleSet(index)}><Icon name="check" size={18} stroke={2.6} /></button>
         </div>
       </div>;

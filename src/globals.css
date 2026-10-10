@@ -373,3 +373,6 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .set-grid.current .set-input.side input { border: 2px solid var(--accent); background: var(--card); }
 .set-grid.with-ballast:has(.side-inputs) { grid-template-columns: 34px minmax(0, 1.7fr) minmax(0, 1fr) 44px; }
 .set-input.light.side input { font-size: 16px; }
+
+.course-link { min-height: 48px; padding: 0 16px; border-radius: var(--radius-sm); background: var(--card); color: var(--accent-text); display: flex; align-items: center; gap: 10px; font-size: 15px; font-weight: 600; text-decoration: none; }
+.course-link svg:last-child { margin-left: auto; color: var(--faint); }

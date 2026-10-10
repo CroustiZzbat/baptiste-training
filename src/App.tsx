@@ -68,6 +68,7 @@ type SummaryRow = {
 };
 
 const LEVEL_LABELS: Record<LevelKey, string> = { handstand: "Handstand", hspu: "HSPU", dragon: "Dragon Flag", pistol: "Pistol Squat", lsit: "L-Sit" };
+const COURSE_URL = "https://programmes.ericflag.com/courses/1500711";
 const SHORT_DAY = ["Up 1", "Low 1", "Libre", "Up 2", "Libre", "5×7", "Libre"];
 
 /** merge = true : un superset / circuit devient un seul écran (tous ses exercices, tour par tour). */
@@ -618,6 +619,7 @@ export default function App() {
 
   const renderProgram = () => <div className="page">
     {header("Programme", "Bloc 1 · 6 semaines")}
+    <a className="course-link" href={COURSE_URL} target="_blank" rel="noopener noreferrer"><Icon name="play" size={14} />Vidéos du programme Eric Flag<Icon name="arrow" size={16} /></a>
     <div className="segmented scroll">{mainPlans.map((plan) => <button key={plan.id} className={selectedPlan.id === plan.id ? "active" : ""} onClick={() => setSelectedPlanId(plan.id)}>J{plan.scheduleDay} · {plan.shortTitle}</button>)}</div>
     <section className="card">
       <div className="plan-head"><div><h2>{selectedPlan.title}</h2><p>{selectedPlan.focus}</p></div><span className="pill"><Icon name="clock" size={15} />{selectedPlan.duration} min</span></div>
@@ -918,6 +920,7 @@ export default function App() {
             </div>)}
           </div>}
         </div>}
+        <a className="course-link" href={COURSE_URL} target="_blank" rel="noopener noreferrer"><Icon name="play" size={14} />Vidéos du programme Eric Flag<Icon name="arrow" size={16} /></a>
       </div>
 
       <div className="workout-bar">

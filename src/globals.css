@@ -339,3 +339,28 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
+
+/* ---------- V5.3 : supersets et circuits sur un seul écran ---------- */
+.set-wrap { border-top: 1px solid var(--line); }
+.set-wrap .set-grid { border-top: 0; }
+.sets > .set-grid.head + .set-wrap { border-top: 0; }
+.set-wrap.multi { padding-top: 8px; }
+.set-label { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: var(--text); }
+.set-label em { margin-left: auto; color: var(--muted); font-style: normal; font-weight: 500; font-size: 12px; white-space: nowrap; }
+.set-letter { width: 20px; height: 20px; border-radius: 6px; background: var(--accent-soft); color: var(--accent-text); display: inline-flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 800; flex: 0 0 auto; }
+.set-wrap.multi .set-grid { min-height: 54px; }
+.set-wrap.multi .set-number { visibility: hidden; }
+.round { padding: 6px 0 4px; }
+.round + .round { border-top: 2px solid var(--line); margin-top: 4px; }
+.round-head { display: flex; align-items: center; gap: 6px; padding: 8px 0 2px; color: var(--accent-text); font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; }
+.round .set-wrap:first-of-type { border-top: 0; }
+.last-time.multi { flex-direction: column; align-items: stretch; gap: 8px; }
+.last-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: baseline; gap: 10px; }
+.last-row span { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 14px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.last-row b { color: var(--accent-text); font-size: 12px; }
+.last-row strong { font-size: 17px !important; }
+.last-row em { color: var(--muted); font-style: normal; font-size: 12px; }
+.tips-group { display: flex; flex-direction: column; gap: 4px; }
+.tips-group + .tips-group { padding-top: 8px; border-top: 1px solid var(--line); }
+.tips-name { color: var(--text); font-size: 14px; }
+.variant-field > span { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; white-space: nowrap; }

@@ -69,10 +69,11 @@ type SummaryRow = {
 const LEVEL_LABELS: Record<LevelKey, string> = { handstand: "Handstand", hspu: "HSPU", dragon: "Dragon Flag", pistol: "Pistol Squat", lsit: "L-Sit" };
 const SHORT_DAY = ["Up 1", "Low 1", "Libre", "Up 2", "Libre", "5×7", "Libre"];
 
-function groupExercises(steps: ActiveStep[]): ExerciseGroup[] {
+/** merge = true : un superset / circuit devient un seul écran (tous ses exercices, tour par tour). */
+function groupExercises(steps: ActiveStep[], merge = false): ExerciseGroup[] {
   const groups = new Map<string, ExerciseGroup>();
   steps.forEach((step, index) => {
-    const key = `${step.blockId}:${step.id}`;
+    const key = merge && (step.blockKind === "superset" || step.blockKind === "circuit") ? step.blockId : `${step.blockId}:${step.id}`;
     const current = groups.get(key);
     if (current) current.entries.push({ index, step });
     else groups.set(key, { key, firstIndex: index, entries: [{ index, step }] });
@@ -307,12 +308,19 @@ export default function App() {
   const absoluteDay = complete ? 42 : (store.currentWeek - 1) * 7 + store.cycleDay;
   const status = recoveryStatus(store.recovery);
   const active = store.active;
-  const groups = active ? groupExercises(active.steps) : [];
+  const groups = active ? groupExercises(active.steps, true) : [];
+  const exerciseGroups = active ? groupExercises(active.steps) : [];
   const groupIndex = active ? Math.max(0, groups.findIndex((group) => group.entries.some(({ index }) => index === active.stepIndex))) : 0;
   const group = groups[groupIndex] ?? null;
   const step = group?.entries[0]?.step ?? null;
-  const previous = step ? lastPerformance(store.history, step.id) : null;
-  const best = step ? personalBest(store.history, step.id) : null;
+  /* Exercices de l'écran courant (plusieurs pour un superset / circuit), avec leur historique. */
+  const members = group ? [...new Map(group.entries.map(({ step: item }) => [item.id, item])).values()].map((item) => ({
+    step: item,
+    entries: group.entries.filter(({ step: entry }) => entry.id === item.id),
+    previous: lastPerformance(store.history, item.id),
+    best: personalBest(store.history, item.id),
+    hint: progressionHint(store.history, item, item.levelKey ? store.levels[item.levelKey] : null),
+  })) : [];
   const staleActive = active && Date.now() - (active.lastActivityAt ?? active.startedAt) > 6 * 3600 * 1000;
   const mainDone = store.history.filter((record) => record.kind === "main" || record.kind === "challenge").length;
   const missedCount = store.history.filter((record) => record.kind === "missed").length;
@@ -322,7 +330,6 @@ export default function App() {
   const selectedPlan = mainPlans.find((plan) => plan.id === selectedPlanId) ?? mainPlans[0];
   const daysSinceExport = store.lastExportAt ? Math.floor((Date.now() - Date.parse(store.lastExportAt)) / 86400000) : null;
   const needsBackup = store.history.length > 0 && (daysSinceExport === null || daysSinceExport >= 7);
-  const hint = step ? progressionHint(store.history, step, step.levelKey ? store.levels[step.levelKey] : null) : null;
   const editedRecord = sheet?.type === "record" ? store.history.find((record) => record.id === sheet.id) ?? null : null;
   const jumpTarget = sheet?.type === "jump" ? sheet.day : null;
   const jumpSkipped = jumpTarget ? Array.from({ length: jumpTarget - store.cycleDay }, (_, index) => store.cycleDay + index) : [];
@@ -348,9 +355,9 @@ export default function App() {
   };
   const updateResult = (stepIndex: number, field: "value" | "ballast", value: string) =>
     updateSteps((item, index) => index === stepIndex ? { ...item, result: { ...item.result, [field]: value } } : item);
-  const setGroupVariant = (value: string) => {
+  const setGroupVariant = (value: string, exerciseId: string) => {
     if (!group) return;
-    const indexes = new Set(group.entries.map(({ index }) => index));
+    const indexes = new Set(group.entries.filter(({ step: item }) => item.id === exerciseId).map(({ index }) => index));
     updateSteps((item, index) => indexes.has(index) ? { ...item, result: { ...item.result, variant: value } } : item);
   };
   const updateMiniSet = (stepIndex: number, setIndex: number, value: string) =>
@@ -362,7 +369,7 @@ export default function App() {
     const target = active?.steps[stepIndex];
     if (!target) return;
     const wasDone = target.result.done;
-    const fallback = target.result.value === "" ? previous?.results.find((result) => result.series === target.round)?.value : null;
+    const fallback = target.result.value === "" ? lastPerformance(store.history, target.id)?.results.find((result) => result.series === target.round)?.value : null;
     updateSteps((item, index) => index === stepIndex ? { ...item, result: { ...item.result, done: !wasDone, value: !wasDone && fallback != null ? String(fallback) : item.result.value } } : item);
     if (!wasDone) startRest(target.restSec);
   };
@@ -372,7 +379,7 @@ export default function App() {
     const allDone = groupDone(group);
     const indexes = new Set(group.entries.map(({ index }) => index));
     updateSteps((item, index) => indexes.has(index) ? { ...item, result: { ...item.result, done: !allDone } } : item);
-    if (!allDone && step.tracking !== "challenge") startRest(step.restSec);
+    if (!allDone && step.tracking !== "challenge") startRest(group.entries[group.entries.length - 1].step.restSec);
   };
 
   const goToGroup = (index: number) => {
@@ -633,7 +640,7 @@ export default function App() {
   </div>;
 
   const renderSummary = () => {
-    const rows = active ? activeSummary(groups, store.levels) : lastSession ? completedSummary(lastSession) : [];
+    const rows = active ? activeSummary(exerciseGroups, store.levels) : lastSession ? completedSummary(lastSession) : [];
     const doneSets = rows.reduce((sum, row) => sum + row.completedSets, 0);
     const plannedSets = rows.reduce((sum, row) => sum + (row.plannedSets ?? 0), 0);
     const totalReps = rows.filter((row) => row.tracking === "reps" || row.tracking === "challenge").reduce((sum, row) => sum + (row.total ?? 0), 0);
@@ -675,7 +682,7 @@ export default function App() {
         </section>
         <section className="card">
           <div className="rows">{rows.map((row) => {
-            const index = groups.findIndex((item) => item.key === row.key);
+            const index = groups.findIndex((item) => item.entries.some(({ step: entry }) => `${entry.blockId}:${entry.id}` === row.key));
             const value = row.tracking === "check" ? (row.level ? `Niv. ${row.level}` : "—") : row.total === null ? "—" : `${row.total} ${unitFor(row.tracking)}`;
             const content = <>
               <span className={`status-dot ${row.status}`} />
@@ -779,16 +786,40 @@ export default function App() {
     </div>;
     const isChallenge = step.tracking === "challenge";
     const isCheck = step.tracking === "check";
-    const showBallast = step.loadMode === "weighted" || step.loadMode === "band_or_weight";
-    const showVariant = step.loadMode !== "none" && !isChallenge;
+    const isMulti = members.length > 1;
+    const showBallast = members.some(({ step: item }) => item.loadMode === "weighted" || item.loadMode === "band_or_weight");
     const allDone = groupDone(group);
     const isLast = groupIndex === groups.length - 1;
     const minutes = Math.round((active.activeMs ?? 0) / 60000);
     const blockKind = step.blockKind === "superset" ? "Superset" : step.blockKind === "circuit" ? "Circuit" : step.blockKind === "challenge" ? "Challenge" : step.blockLabel;
-    const previousVariant = previous?.results.map((result) => result.variant.trim()).find((value) => value && !/^[0\-–—.]+$/.test(value)) ?? "";
     const timerVisible = Boolean(restEndAt);
     const timerLabel = active.restLabel ?? "Repos";
     const nextGroup = groups[groupIndex + 1];
+    const shortName = (name: string) => { const value = name.replace("Progression ", "").replace(" à un bras", "").replace("Gainage drapeau — autre côté", "Drapeau (autre côté)"); return value.charAt(0).toUpperCase() + value.slice(1); };
+    const letters = "ABCDEFGH";
+    const rounds = [...new Set(group.entries.map(({ step: item }) => item.round))];
+    const firstOpenIndex = group.entries.find(({ step: entry }) => !entry.result.done)?.index;
+    const lastStep = group.entries[group.entries.length - 1].step;
+    const title = isMulti ? (members.length <= 2 ? members.map(({ step: item }) => item.name).join(" + ") : step.blockLabel) : step.name;
+    const cleanVariant = (value: string) => value && !/^[0\-–—.]+$/.test(value);
+
+    const renderSetRow = (index: number, item: ActiveStep, member: typeof members[number], memberIndex: number) => {
+      const prevSet = member.previous?.results.find((result) => result.series === item.round && result.value !== null) ?? null;
+      const current = item.result.value === "" ? null : Number(item.result.value);
+      const delta = prevSet?.value != null && current !== null && Number.isFinite(current) ? Math.round((current - prevSet.value) * 10) / 10 : null;
+      const hasBallast = item.loadMode === "weighted" || item.loadMode === "band_or_weight";
+      return <div key={item.stepId} className={`set-wrap ${isMulti ? "multi" : ""}`}>
+        {isMulti && <div className="set-label"><span className="set-letter">{letters[memberIndex]}</span>{shortName(item.name)}<em>{item.target}{item.tracking === "seconds" && !/s\b/.test(item.target) ? " s" : ""}</em></div>}
+        <div className={`set-grid ${showBallast ? "with-ballast" : ""} ${item.result.done ? "done" : ""} ${firstOpenIndex === index ? "current" : ""}`}>
+          <span className="set-number">{isMulti ? letters[memberIndex] : item.round}</span>
+          {item.result.done ? <span className="set-value"><strong>{item.result.value || "—"}</strong>{member.best && current !== null && current > member.best.value ? <span className="delta record-badge">Record</span> : <Delta value={delta} />}</span>
+            : <label className="set-input"><span className="sr-only">{item.name} série {item.round}</span><input inputMode="decimal" value={item.result.value} placeholder={prevSet?.value != null ? String(prevSet.value) : item.target.match(/\d+/)?.[0] ?? "0"} onChange={(event) => updateResult(index, "value", event.target.value)} /></label>}
+          {showBallast && (!hasBallast ? <span /> : item.result.done ? <span className="set-muted">{item.result.ballast ? `+${item.result.ballast}` : "—"}</span>
+            : <label className="set-input light"><span className="sr-only">Lest {item.name} série {item.round}</span><input inputMode="decimal" value={item.result.ballast} placeholder={prevSet?.ballast ? String(prevSet.ballast) : "0"} onChange={(event) => updateResult(index, "ballast", event.target.value)} /></label>)}
+          <button className={`check-circle ${item.result.done ? "on" : ""}`} aria-label={`${item.result.done ? "Réouvrir" : "Valider"} ${item.name} série ${item.round}`} onClick={() => toggleSet(index)}><Icon name="check" size={18} stroke={2.6} /></button>
+        </div>
+      </div>;
+    };
 
     return <div className="workout">
       <div className="workout-top">
@@ -802,21 +833,28 @@ export default function App() {
         {groupIndex === 0 && <button className={`warmup ${active.warmupDone ? "done" : ""}`} onClick={() => setStore({ ...store, active: { ...active, warmupDone: !active.warmupDone } })}>
           <span className="check-circle small"><Icon name="check" size={14} stroke={2.6} /></span>Échauffement {active.warmupDone ? "fait" : "à faire"}
         </button>}
-        <p className="eyebrow">{blockKind} · exercice {groupIndex + 1} / {groups.length}</p>
-        <h1 className="exercise-title">{step.name}</h1>
-        <div className="chips">
+        <p className="eyebrow">{blockKind} · {groupIndex + 1} / {groups.length}</p>
+        <h1 className="exercise-title">{title}</h1>
+        {isMulti ? <div className="chips">
+          <span className="chip strong">{rounds.length} tours</span>
+          <span className="chip">{members.length} exercices enchaînés</span>
+          {lastStep.restSec > 0 && <span className="chip">Repos {lastStep.restLabel} après le tour</span>}
+        </div> : <div className="chips">
           <span className="chip strong">{isChallenge ? "Max en 7 min" : /^(\d|MR|≈)/.test(step.target) ? `Objectif ${step.target}` : step.target}</span>
           <span className="chip">{step.tempo}</span>
           {step.restSec > 0 && !isChallenge && <span className="chip">Repos {step.restLabel}</span>}
-        </div>
-
-        {step.levelKey && <div className="level-line"><span>Niveau</span><div className="segmented tiny">{([1, 2, 3] as const).map((level) => <button key={level} className={store.levels[step.levelKey!] === level ? "active" : ""} onClick={() => setLevel(step.levelKey!, level)}>{level}</button>)}</div></div>}
-
-        {!isCheck && <div className={`last-time ${previous ? "" : "empty"}`}>
-          <div><small>{previous ? `Dernière fois · ${formatShortDate(previous.record.date)}` : "Dernière fois"}</small><strong>{previous ? previousLine(previous) : "Première fois"}</strong>{previous && previousDetails(previous) && <span>{previousDetails(previous)}</span>}</div>
-          {best && <div className="record"><small>Record</small><strong>{best.value}</strong></div>}
         </div>}
-        {hint && <div className="hint"><strong>{hint.title}</strong><p>{hint.text}</p></div>}
+
+        {step.levelKey && !isMulti && <div className="level-line"><span>Niveau</span><div className="segmented tiny">{([1, 2, 3] as const).map((level) => <button key={level} className={store.levels[step.levelKey!] === level ? "active" : ""} onClick={() => setLevel(step.levelKey!, level)}>{level}</button>)}</div></div>}
+
+        {isMulti ? <div className="last-time multi">
+          <small>Dernière fois{members[0].previous ? ` · ${formatShortDate(members[0].previous.record.date)}` : ""}</small>
+          {members.map((member, memberIndex) => <div className="last-row" key={member.step.id}><span><b>{letters[memberIndex]}</b>{shortName(member.step.name)}</span><strong>{member.previous ? previousLine(member.previous) : "—"}</strong>{member.best && <em>rec. {member.best.value}</em>}</div>)}
+        </div> : !isCheck && <div className={`last-time ${members[0].previous ? "" : "empty"}`}>
+          <div><small>{members[0].previous ? `Dernière fois · ${formatShortDate(members[0].previous.record.date)}` : "Dernière fois"}</small><strong>{members[0].previous ? previousLine(members[0].previous) : "Première fois"}</strong>{members[0].previous && previousDetails(members[0].previous) && <span>{previousDetails(members[0].previous)}</span>}</div>
+          {members[0].best && <div className="record"><small>Record</small><strong>{members[0].best.value}</strong></div>}
+        </div>}
+        {members.filter((member) => member.hint).map((member) => <div className="hint" key={member.step.id}><strong>{isMulti ? `${shortName(member.step.name)} · ` : ""}{member.hint!.title}</strong><p>{member.hint!.text}</p></div>)}
 
         {isChallenge ? <section className="card challenge">
           <div className="challenge-total"><div><small>Total</small><strong>{step.result.miniSets.reduce((sum, value) => sum + (Number(value) || 0), 0)}</strong></div><button className="btn btn-secondary btn-small" onClick={() => startRest(420, "Bloc 7 min")}><Icon name="clock" size={16} />Lancer 7 min</button></div>
@@ -824,44 +862,40 @@ export default function App() {
         </section> : isCheck ? <section className="card">
           <p className="muted">Routine gérée de ton côté : choisis ton niveau, note la variante si besoin, puis valide.</p>
         </section> : <section className="card sets">
-          <div className={`set-grid head ${showBallast ? "with-ballast" : ""}`}><span>Série</span><span>{step.tracking === "seconds" ? "Secondes" : "Reps"}</span>{showBallast && <span>Lest (kg)</span>}<span /></div>
-          {group.entries.map(({ index, step: item }) => {
-            const prevSet = previous?.results.find((result) => result.series === item.round && result.value !== null) ?? null;
-            const current = item.result.value === "" ? null : Number(item.result.value);
-            const delta = prevSet?.value != null && current !== null && Number.isFinite(current) ? Math.round((current - prevSet.value) * 10) / 10 : null;
-            const firstOpen = group.entries.find(({ step: entry }) => !entry.result.done)?.index === index;
-            return <div key={item.stepId} className={`set-grid ${showBallast ? "with-ballast" : ""} ${item.result.done ? "done" : ""} ${firstOpen ? "current" : ""}`}>
-              <span className="set-number">{item.round}</span>
-              {item.result.done ? <span className="set-value"><strong>{item.result.value || "—"}</strong>{best && current !== null && current > best.value ? <span className="delta record-badge">Record</span> : <Delta value={delta} />}</span>
-                : <label className="set-input"><span className="sr-only">{item.name} série {item.round}</span><input inputMode="decimal" value={item.result.value} placeholder={prevSet?.value != null ? String(prevSet.value) : item.target.match(/\d+/)?.[0] ?? "0"} onChange={(event) => updateResult(index, "value", event.target.value)} /></label>}
-              {showBallast && (item.result.done ? <span className="set-muted">{item.result.ballast ? `+${item.result.ballast}` : "—"}</span>
-                : <label className="set-input light"><span className="sr-only">Lest série {item.round}</span><input inputMode="decimal" value={item.result.ballast} placeholder={prevSet?.ballast ? String(prevSet.ballast) : "0"} onChange={(event) => updateResult(index, "ballast", event.target.value)} /></label>)}
-              <button className={`check-circle ${item.result.done ? "on" : ""}`} aria-label={`${item.result.done ? "Réouvrir" : "Valider"} la série ${item.round}`} onClick={() => toggleSet(index)}><Icon name="check" size={18} stroke={2.6} /></button>
-            </div>;
-          })}
+          {!isMulti && <div className={`set-grid head ${showBallast ? "with-ballast" : ""}`}><span>Série</span><span>{step.tracking === "seconds" ? "Secondes" : "Reps"}</span>{showBallast && <span>Lest (kg)</span>}<span /></div>}
+          {isMulti ? rounds.map((round) => <div className="round" key={round}>
+            <div className="round-head"><span>Tour {round}</span>{group.entries.filter(({ step: item }) => item.round === round).every(({ step: item }) => item.result.done) && <Icon name="check" size={14} stroke={2.6} />}</div>
+            {group.entries.filter(({ step: item }) => item.round === round).map(({ index, step: item }) => { const memberIndex = members.findIndex((member) => member.step.id === item.id); return renderSetRow(index, item, members[memberIndex], memberIndex); })}
+          </div>) : group.entries.map(({ index, step: item }) => renderSetRow(index, item, members[0], 0))}
         </section>}
 
-        {(showVariant || isCheck) && <label className="variant-field">
-          <span>Variante</span>
-          <input value={step.result.variant} placeholder={previousVariant || "Aucune assistance"} onChange={(event) => setGroupVariant(event.target.value)} />
-        </label>}
+        {members.filter(({ step: item }) => (item.loadMode !== "none" && item.tracking !== "challenge") || item.tracking === "check").map((member) => {
+          const previousVariant = member.previous?.results.map((result) => result.variant.trim()).find(cleanVariant) ?? "";
+          return <label className="variant-field" key={member.step.id}>
+            <span>{isMulti ? <><span className="set-letter">{letters[members.indexOf(member)]}</span> Variante</> : "Variante"}</span>
+            <input value={member.entries[0].step.result.variant} placeholder={previousVariant || "Aucune assistance"} onChange={(event) => setGroupVariant(event.target.value, member.step.id)} />
+          </label>;
+        })}
 
         {(isCheck || isChallenge) && <button className={`btn ${allDone ? "btn-secondary" : "btn-primary"}`} onClick={toggleGroup}><Icon name="check" size={18} stroke={2.4} />{allDone ? "Validé" : "Valider l’exercice"}</button>}
         {!isCheck && !isChallenge && !allDone && <button className="btn btn-text" onClick={toggleGroup}>Tout valider d’un coup</button>}
 
-        {(step.easier || step.harder || step.note) && <div className="tips">
+        {members.some(({ step: item }) => item.easier || item.harder || item.note) && <div className="tips">
           <button className="tips-toggle" onClick={() => setTipsOpen(!tipsOpen)}>Conseils <Icon name="chevron" size={16} /></button>
           {tipsOpen && <div className="tips-body">
-            {step.note && <p>{step.note}</p>}
-            {step.easier && <p><strong>Plus simple :</strong> {step.easier}</p>}
-            {step.harder && <p><strong>Plus dur :</strong> {step.harder}</p>}
+            {members.filter(({ step: item }) => item.easier || item.harder || item.note).map(({ step: item }) => <div key={item.id} className="tips-group">
+              {isMulti && <strong className="tips-name">{item.name}</strong>}
+              {item.note && <p>{item.note}</p>}
+              {item.easier && <p><strong>Plus simple :</strong> {item.easier}</p>}
+              {item.harder && <p><strong>Plus dur :</strong> {item.harder}</p>}
+            </div>)}
           </div>}
         </div>}
       </div>
 
       <div className="workout-bar">
         {timerVisible ? <div className="rest-bar">
-          <div className="grow"><small>{timerLabel}{nextGroup && timerLabel === "Repos" && allDone ? ` · puis ${nextGroup.entries[0].step.name.replace("Progression ", "")}` : ""}</small><strong>{formatTimer(restRemaining)}</strong></div>
+          <div className="grow"><small>{timerLabel}{nextGroup && timerLabel === "Repos" && allDone ? ` · puis ${shortName(nextGroup.entries[0].step.name)}` : ""}</small><strong>{formatTimer(restRemaining)}</strong></div>
           <button className="rest-ghost" onClick={() => addRest(15)}>+15</button>
           <button className="rest-main" onClick={resetTimer}>Passer</button>
         </div> : <div className="nav-bar">
@@ -925,7 +959,7 @@ export default function App() {
             const doneCount = item.entries.filter(({ step: entry }) => entry.result.done).length;
             return <button key={item.key} className={`row row-button ${index === groupIndex ? "current" : ""}`} onClick={() => goToGroup(index)}>
               <span className={`status-dot ${groupDone(item) ? "done" : doneCount ? "active" : "todo"}`} />
-              <span className="grow"><strong>{item.entries[0].step.name}</strong><small>{doneCount}/{item.entries.length} séries</small></span>
+              <span className="grow"><strong>{[...new Set(item.entries.map(({ step: entry }) => entry.name))].join(" + ")}</strong><small>{doneCount}/{item.entries.length} séries</small></span>
               <Icon name="chevron" size={16} />
             </button>;
           })}</div>

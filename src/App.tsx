@@ -25,6 +25,7 @@ import {
   migrateStore,
   personalBest,
   progressionHint,
+  isUnilateral,
   progressionExercises,
   recoveryStatus,
   skillMetrics,
@@ -141,7 +142,7 @@ function previousLine(previous: PreviousPerformance) {
   const first = previous.results[0];
   if (first.tracking === "challenge") return `${first.challengeTotal ?? 0} reps`;
   if (first.tracking === "check") return [first.level ? `Niveau ${first.level}` : "Validé", first.variant.trim()].filter(Boolean).join(" · ");
-  const values = previous.results.map((result) => result.value).filter((value): value is number => value !== null);
+  const values = previous.results.filter((result) => result.value !== null).map((result) => result.sides && (result.sides.left !== null || result.sides.right !== null) ? `${result.sides.left ?? "–"}/${result.sides.right ?? "–"}` : String(result.value));
   if (!values.length) return "—";
   return first.tracking === "seconds" ? `${values.join(" · ")} s` : values.join(" · ");
 }
@@ -355,6 +356,14 @@ export default function App() {
   };
   const updateResult = (stepIndex: number, field: "value" | "ballast", value: string) =>
     updateSteps((item, index) => index === stepIndex ? { ...item, result: { ...item.result, [field]: value } } : item);
+  /** Côté gauche / droit : la valeur de référence (stats, records) est le côté le plus faible. */
+  const updateSide = (stepIndex: number, side: "left" | "right", value: string) =>
+    updateSteps((item, index) => {
+      if (index !== stepIndex) return item;
+      const next = { ...item.result, [side]: value };
+      const numbers = [next.left, next.right].filter((entry): entry is string => entry !== undefined && entry !== "").map(Number).filter(Number.isFinite);
+      return { ...item, result: { ...next, value: numbers.length ? String(Math.min(...numbers)) : "" } };
+    });
   const setGroupVariant = (value: string, exerciseId: string) => {
     if (!group) return;
     const indexes = new Set(group.entries.filter(({ step: item }) => item.id === exerciseId).map(({ index }) => index));
@@ -369,8 +378,20 @@ export default function App() {
     const target = active?.steps[stepIndex];
     if (!target) return;
     const wasDone = target.result.done;
-    const fallback = target.result.value === "" ? lastPerformance(store.history, target.id)?.results.find((result) => result.series === target.round)?.value : null;
-    updateSteps((item, index) => index === stepIndex ? { ...item, result: { ...item.result, done: !wasDone, value: !wasDone && fallback != null ? String(fallback) : item.result.value } } : item);
+    const prevResult = lastPerformance(store.history, target.id)?.results.find((result) => result.series === target.round);
+    const fallback = target.result.value === "" ? prevResult?.value : null;
+    const unilateral = isUnilateral(target);
+    updateSteps((item, index) => {
+      if (index !== stepIndex) return item;
+      const result = { ...item.result, done: !wasDone };
+      if (!wasDone && unilateral) {
+        const left = result.left || (prevResult?.sides?.left ?? prevResult?.value)?.toString() || "";
+        const right = result.right || (prevResult?.sides?.right ?? prevResult?.value)?.toString() || "";
+        const numbers = [left, right].filter(Boolean).map(Number);
+        return { ...item, result: { ...result, left, right, value: numbers.length ? String(Math.min(...numbers)) : result.value } };
+      }
+      return { ...item, result: { ...result, value: !wasDone && fallback != null ? String(fallback) : item.result.value } };
+    });
     if (!wasDone) startRest(target.restSec);
   };
 
@@ -400,6 +421,7 @@ export default function App() {
       tracking: item.tracking,
       series: item.round,
       value: item.result.value === "" ? null : Number(item.result.value),
+      sides: isUnilateral(item) && (item.result.left || item.result.right) ? { left: item.result.left ? Number(item.result.left) : null, right: item.result.right ? Number(item.result.right) : null } : undefined,
       ballast: item.result.ballast === "" ? null : Number(item.result.ballast),
       variant: item.result.variant,
       rpe: item.result.rpe === "" ? null : Number(item.result.rpe),
@@ -808,11 +830,16 @@ export default function App() {
       const current = item.result.value === "" ? null : Number(item.result.value);
       const delta = prevSet?.value != null && current !== null && Number.isFinite(current) ? Math.round((current - prevSet.value) * 10) / 10 : null;
       const hasBallast = item.loadMode === "weighted" || item.loadMode === "band_or_weight";
+      const unilateral = isUnilateral(item);
       return <div key={item.stepId} className={`set-wrap ${isMulti ? "multi" : ""}`}>
         {isMulti && <div className="set-label"><span className="set-letter">{letters[memberIndex]}</span>{shortName(item.name)}<em>{item.target}{item.tracking === "seconds" && !/s\b/.test(item.target) ? " s" : ""}</em></div>}
         <div className={`set-grid ${showBallast ? "with-ballast" : ""} ${item.result.done ? "done" : ""} ${firstOpenIndex === index ? "current" : ""}`}>
           <span className="set-number">{isMulti ? letters[memberIndex] : item.round}</span>
-          {item.result.done ? <span className="set-value"><strong>{item.result.value || "—"}</strong>{member.best && current !== null && current > member.best.value ? <span className="delta record-badge">Record</span> : <Delta value={delta} />}</span>
+          {item.result.done ? <span className="set-value"><strong>{unilateral && (item.result.left || item.result.right) ? `${item.result.left || "–"}/${item.result.right || "–"}` : item.result.value || "—"}</strong>{member.best && current !== null && current > member.best.value ? <span className="delta record-badge">Record</span> : <Delta value={delta} />}</span>
+            : unilateral ? <span className="side-inputs">
+              <label className="set-input side"><span className="side-tag">G</span><span className="sr-only">{item.name} série {item.round} côté gauche</span><input inputMode="decimal" value={item.result.left ?? ""} placeholder={String(prevSet?.sides?.left ?? prevSet?.value ?? item.target.match(/\d+/)?.[0] ?? "0")} onChange={(event) => updateSide(index, "left", event.target.value)} /></label>
+              <label className="set-input side"><span className="side-tag">D</span><span className="sr-only">{item.name} série {item.round} côté droit</span><input inputMode="decimal" value={item.result.right ?? ""} placeholder={String(prevSet?.sides?.right ?? prevSet?.value ?? item.target.match(/\d+/)?.[0] ?? "0")} onChange={(event) => updateSide(index, "right", event.target.value)} /></label>
+            </span>
             : <label className="set-input"><span className="sr-only">{item.name} série {item.round}</span><input inputMode="decimal" value={item.result.value} placeholder={prevSet?.value != null ? String(prevSet.value) : item.target.match(/\d+/)?.[0] ?? "0"} onChange={(event) => updateResult(index, "value", event.target.value)} /></label>}
           {showBallast && (!hasBallast ? <span /> : item.result.done ? <span className="set-muted">{item.result.ballast ? `+${item.result.ballast}` : "—"}</span>
             : <label className="set-input light"><span className="sr-only">Lest {item.name} série {item.round}</span><input inputMode="decimal" value={item.result.ballast} placeholder={prevSet?.ballast ? String(prevSet.ballast) : "0"} onChange={(event) => updateResult(index, "ballast", event.target.value)} /></label>)}
@@ -862,7 +889,7 @@ export default function App() {
         </section> : isCheck ? <section className="card">
           <p className="muted">Routine gérée de ton côté : choisis ton niveau, note la variante si besoin, puis valide.</p>
         </section> : <section className="card sets">
-          {!isMulti && <div className={`set-grid head ${showBallast ? "with-ballast" : ""}`}><span>Série</span><span>{step.tracking === "seconds" ? "Secondes" : "Reps"}</span>{showBallast && <span>Lest (kg)</span>}<span /></div>}
+          {!isMulti && <div className={`set-grid head ${showBallast ? "with-ballast" : ""}`}><span>Série</span><span>{step.tracking === "seconds" ? "Secondes" : "Reps"}{isUnilateral(step) ? " · G / D" : ""}</span>{showBallast && <span>Lest (kg)</span>}<span /></div>}
           {isMulti ? rounds.map((round) => <div className="round" key={round}>
             <div className="round-head"><span>Tour {round}</span>{group.entries.filter(({ step: item }) => item.round === round).every(({ step: item }) => item.result.done) && <Icon name="check" size={14} stroke={2.6} />}</div>
             {group.entries.filter(({ step: item }) => item.round === round).map(({ index, step: item }) => { const memberIndex = members.findIndex((member) => member.step.id === item.id); return renderSetRow(index, item, members[memberIndex], memberIndex); })}

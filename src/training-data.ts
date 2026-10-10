@@ -48,6 +48,9 @@ export type StepResult = {
   rpe: string;
   done: boolean;
   miniSets: string[];
+  /** Exercices unilatéraux (« / côté ») : une valeur par côté. value = côté le plus faible. */
+  left?: string;
+  right?: string;
 };
 
 export type ActiveStep = Exercise & {
@@ -90,6 +93,7 @@ export type SavedExerciseResult = {
   level: number | null;
   challengeTotal: number | null;
   challengeSets?: number[];
+  sides?: { left: number | null; right: number | null };
 };
 
 export type SessionRecord = {
@@ -634,4 +638,9 @@ export function progressionHint(history: SessionRecord[], exercise: Exercise, le
     }
   }
   return null;
+}
+
+/** Exercice fait côté par côté (objectif « … / côté »). */
+export function isUnilateral(exercise: Pick<Exercise, "target" | "tracking">) {
+  return (exercise.tracking === "reps" || exercise.tracking === "seconds") && /\/\s*côté/.test(exercise.target);
 }
